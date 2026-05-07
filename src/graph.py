@@ -1,6 +1,6 @@
 from typing import Literal
 from langgraph.graph import StateGraph, END
-from src.agents import AgentState, architect_node, claude_coder_node, opencode_coder_node
+from src.agents import AgentState, architect_node, claude_coder_node, opencode_coder_node, finalize_node
 
 def route_task(state: AgentState) -> Literal["claude", "opencode"]:
     if "complexa" in state.get("complexity", ""):
@@ -14,6 +14,7 @@ def build_graph():
     workflow.add_node("architect", architect_node)
     workflow.add_node("claude", claude_coder_node)
     workflow.add_node("opencode", opencode_coder_node)
+    workflow.add_node("finalize", finalize_node)
 
     # Definim el flux
     workflow.set_entry_point("architect")
@@ -28,8 +29,9 @@ def build_graph():
         }
     )
 
-    # Finalització
-    workflow.add_edge("claude", END)
-    workflow.add_edge("opencode", END)
+    # Finalitzacio: coders -> finalize -> END
+    workflow.add_edge("claude", "finalize")
+    workflow.add_edge("opencode", "finalize")
+    workflow.add_edge("finalize", END)
 
     return workflow.compile()
