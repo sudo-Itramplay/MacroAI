@@ -9,8 +9,13 @@ WHAT IS A STATEGRAPH?
   The graph passes a shared dictionary (AgentState) from node to node.
 
 OUR FLOW:
+  ┌───────────┐
+  │ optimizer │  <-- entry point (OpenCode structures the raw user input)
+  └─────┬─────┘
+        │
+        ▼
   ┌─────────────┐
-  │  architect  │  <-- entry point (Kimi plans the task)
+  │  architect  │  <-- Kimi plans the task using the structured spec
   └──────┬──────┘
          │
          ▼
@@ -37,6 +42,7 @@ from typing import Literal
 from langgraph.graph import StateGraph, END
 from src.agents import (
     AgentState,
+    opencode_optimizer_node,
     architect_node,
     claude_coder_node,
     opencode_coder_node,
@@ -80,6 +86,7 @@ def build_graph():
     # Every node is just a Python function. The string name is how we
     # reference it when wiring up edges.
     # -------------------------------------------------------------------------
+    workflow.add_node("optimizer", opencode_optimizer_node)
     workflow.add_node("architect", architect_node)
     workflow.add_node("claude", claude_coder_node)
     workflow.add_node("opencode", opencode_coder_node)
@@ -88,9 +95,13 @@ def build_graph():
     # -------------------------------------------------------------------------
     # SET ENTRY POINT
     # -------------------------------------------------------------------------
-    # Every graph invocation starts here.
+    # The optimizer runs first: it translates the raw user text into a clean
+    # structured spec before the Architect ever sees it.
     # -------------------------------------------------------------------------
-    workflow.set_entry_point("architect")
+    workflow.set_entry_point("optimizer")
+
+    # optimizer always feeds directly into architect
+    workflow.add_edge("optimizer", "architect")
 
     # -------------------------------------------------------------------------
     # CONDITIONAL EDGE: architect -> (claude OR opencode)

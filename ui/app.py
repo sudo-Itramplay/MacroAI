@@ -1,0 +1,294 @@
+"""
+ui/app.py
+=========
+Aplicació principal de MacroAI basada en Textual (TUI async-native).
+
+PER QUÈ TEXTUAL I NO UNA WEB UI?
+----------------------------------
+  1. Tots els agents són CLIs: l'entorn natural és el terminal.
+  2. Cap latència de navegador ni problemes de CORS.
+  3. Textual és async-native: encaixa perfectament amb la nostra
+     arquitectura de asyncio + ThreadPoolExecutor.
+  4. Funciona directament a Hyprland/alacritty sense cap servei extern.
+
+LAYOUT DE LA PANTALLA
+----------------------
+  ┌──────────────────────────────────────────────────────────┐
+  │ MacroAI  |  sessió: macroai-session          [Q] Sortir  │
+  ├──────────────┬────────────────────┬────────────────────  │
+  │  PROJECTES   │  PIPELINE          │  CODI GENERAT        │
+  │  (sessions)  │  ✓ optimizer ...   │  (TextArea)          │
+  │              ├────────────────────┤                      │
+  │              │  REQUERIMENT       │                      │
+  │              │  [_____________]   │                      │
+  │              │  [▶ Executar]      │                      │
+  │              ├────────────────────┤                      │
+  │              │  LOG EN VIU        │                      │
+  │              │  (RichLog scroll)  │                      │
+  └──────────────┴────────────────────┴──────────────────────┘
+
+GESTIÓ DE LA CONCURRÈNCIA
+--------------------------
+  @work(exclusive=True) garanteix que només una execució del graf
+  corre alhora. Internament:
+    - asyncio.create_task(runner.run(...))  -> executa el graf
+    - asyncio.create_task(_poll_queues())   -> polling de les cues de log/estat
+  Ambdues tasques corren concurrent en el bucle asyncio de Textual.
+"""
+
+import asyncio
+from textual.app import App, ComposeResult
+from textual.widgets import Header, Footer, Input, Button, Label
+from textual.containers import Horizontal, Vertical
+from textual import on, work
+
+from ui.runner import GraphRunner, LogEntry, StateSnapshot
+from ui.widgets import ProjectPanel, LogPanel, StatePanel, ResultPanel
+
+
+class MacroAIApp(App):
+    """Aplicació TUI principal de MacroAI."""
+
+    TITLE = "MacroAI"
+    SUB_TITLE = "Sistema Multiagent (Kimi + Claude + OpenCode)"
+
+    CSS = """
+    Screen {
+        layout: horizontal;
+        background: $surface;
+    }
+
+    ProjectPanel {
+        width: 26;
+        height: 100%;
+        border-right: solid $primary-darken-2;
+    }
+
+    #center-pane {
+        width: 1fr;
+        height: 100%;
+        layout: vertical;
+    }
+
+    StatePanel {
+        height: auto;
+        max-height: 9;
+        border-bottom: solid $primary-darken-2;
+    }
+
+    #input-area {
+        height: auto;
+        padding: 1;
+        border-bottom: solid $primary-darken-2;
+        layout: vertical;
+    }
+
+    #requirements-input {
+        width: 1fr;
+        margin-bottom: 1;
+    }
+
+    #run-button {
+        width: 100%;
+    }
+
+    LogPanel {
+        height: 1fr;
+    }
+
+    ResultPanel {
+        width: 42;
+        height: 100%;
+        border-left: solid $primary-darken-2;
+    }
+
+    .panel-title {
+        text-style: bold;
+        color: $accent;
+    }
+
+    .label-small {
+        color: $text-muted;
+        text-style: italic;
+    }
+    """
+
+    BINDINGS = [
+        ("ctrl+r", "run_graph", "Executar"),
+        ("ctrl+l", "clear_log", "Netejar log"),
+        ("q", "quit", "Sortir"),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.runner = GraphRunner()
+        self._selected_session = "macroai-session"
+
+    # ------------------------------------------------------------------
+    # Composició de la pantalla
+    # ------------------------------------------------------------------
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Horizontal():
+            yield ProjectPanel(id="project-panel")
+            with Vertical(id="center-pane"):
+                yield StatePanel(id="state-panel")
+                with Vertical(id="input-area"):
+                    yield Label("Requeriment del projecte:", classes="label-small")
+                    yield Input(
+                        placeholder="Descriu la funcionalitat a implementar...",
+                        id="requirements-input",
+                    )
+                    yield Button("▶  Executar graf", id="run-button", variant="primary")
+                yield LogPanel(id="log-panel")
+            yield ResultPanel(id="result-panel")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._update_subtitle()
+        self.query_one(LogPanel).add_system(
+            "Benvingut a MacroAI. Selecciona una sessió i introdueix un requeriment."
+        )
+
+    # ------------------------------------------------------------------
+    # Handlers dels missatges dels widgets fills
+    # ------------------------------------------------------------------
+
+    @on(ProjectPanel.SessionSelected)
+    def _on_session_selected(self, msg: ProjectPanel.SessionSelected) -> None:
+        self._selected_session = msg.session_id
+        self._update_subtitle()
+        self.query_one(LogPanel).add_system(
+            f"Sessió seleccionada: {msg.session_id}"
+        )
+
+    @on(ProjectPanel.SessionCreated)
+    def _on_session_created(self, msg: ProjectPanel.SessionCreated) -> None:
+        self._selected_session = msg.session_id
+        self._update_subtitle()
+        self.query_one(LogPanel).add_system(
+            f"Nova sessió creada: {msg.session_id}"
+        )
+
+    @on(Button.Pressed, "#run-button")
+    def _on_run_pressed(self, _: Button.Pressed) -> None:
+        self.action_run_graph()
+
+    # ------------------------------------------------------------------
+    # Accions (binding + programàtic)
+    # ------------------------------------------------------------------
+
+    def action_run_graph(self) -> None:
+        """Inicia l'execució del graf si no hi ha una en curs."""
+        if self.runner.is_running:
+            self.query_one(LogPanel).add_system(
+                "Ja hi ha una execució en curs. Espera que acabi."
+            )
+            return
+        requirements = self.query_one("#requirements-input", Input).value.strip()
+        if not requirements:
+            self.query_one(LogPanel).add_system(
+                "Introdueix un requeriment abans d'executar."
+            )
+            return
+        self._execute_graph(requirements)
+
+    def action_clear_log(self) -> None:
+        self.query_one(LogPanel).clear_log()
+
+    # ------------------------------------------------------------------
+    # Worker principal (execució asíncrona del graf)
+    # ------------------------------------------------------------------
+
+    @work(exclusive=True)
+    async def _execute_graph(self, requirements: str) -> None:
+        """
+        Worker de Textual: gestiona tot el cicle d'execució del graf.
+
+        @work(exclusive=True) garanteix que si es crida mentre ja corre,
+        la nova crida es descarta automàticament.
+
+        Dins el worker:
+          - run_task  : executa el graf al ThreadPoolExecutor
+          - poll_task : llegeix les cues i actualitza els widgets cada 80ms
+          Les dues tasques corren concurrent en el bucle asyncio de Textual.
+        """
+        log = self.query_one(LogPanel)
+        state_panel = self.query_one(StatePanel)
+        result_panel = self.query_one(ResultPanel)
+        btn = self.query_one("#run-button", Button)
+
+        # Preparem la UI per a la nova execució
+        btn.disabled = True
+        btn.label = "⏳  Executant..."
+        log.clear_log()
+        state_panel.reset()
+        result_panel.clear()
+
+        run_task = asyncio.create_task(
+            self.runner.run(self._selected_session, requirements)
+        )
+        poll_task = asyncio.create_task(
+            self._poll_queues(log, state_panel)
+        )
+
+        try:
+            result = await run_task
+            # Esperem que el poll buidí les cues restants
+            await poll_task
+
+            result_panel.show_code(
+                result.get("generated_code", "(cap codi generat)"),
+                result.get("complexity", ""),
+            )
+            # Actualitzem la llista de sessions per reflectir la nova memòria guardada
+            self.query_one(ProjectPanel)._refresh_list()
+
+        except Exception as exc:
+            log.add_system(f"Error durant l'execució: {exc}", is_error=True)
+            poll_task.cancel()
+        finally:
+            btn.disabled = False
+            btn.label = "▶  Executar graf"
+
+    async def _poll_queues(self, log: LogPanel, state: StatePanel) -> None:
+        """
+        Llegeix periòdicament les cues del runner i actualitza els widgets.
+
+        Continua mentre el graf corre O mentre queden ítems a les cues.
+        El sleep de 80ms és un balanç entre responsivitat de la UI i CPU usage.
+        """
+        while (
+            self.runner.is_running
+            or not self.runner.log_queue.empty()
+            or not self.runner.state_queue.empty()
+        ):
+            # Drena tots els logs disponibles en aquest cicle
+            while not self.runner.log_queue.empty():
+                try:
+                    entry: LogEntry = self.runner.log_queue.get_nowait()
+                    log.add_entry(entry)
+                except asyncio.QueueEmpty:
+                    break
+
+            # Drena tots els snapshots d'estat disponibles en aquest cicle
+            while not self.runner.state_queue.empty():
+                try:
+                    snap: StateSnapshot = self.runner.state_queue.get_nowait()
+                    state.update_from_snapshot(snap)
+                except asyncio.QueueEmpty:
+                    break
+
+            await asyncio.sleep(0.08)
+
+    # ------------------------------------------------------------------
+    # Cicle de vida
+    # ------------------------------------------------------------------
+
+    def _update_subtitle(self) -> None:
+        self.sub_title = f"sessió: {self._selected_session}"
+
+    def on_unmount(self) -> None:
+        """Alliberem el thread pool en tancar l'aplicació."""
+        self.runner.shutdown()

@@ -23,7 +23,7 @@ ARCHITECTURE NOTES:
 import os
 import re
 import subprocess
-from typing import TypedDict
+from typing import Callable, Optional, TypedDict
 
 
 # =============================================================================
@@ -33,6 +33,36 @@ from typing import TypedDict
 # The gitignore keeps these out of the repo so you don't leak project details.
 # ---------------------------------------------------------------------------
 MEMORY_DIR = ".macroai_memory"
+
+
+# =============================================================================
+# LOG SINK  --  Mecanisme d'observabilitat per a la UI (opcional)
+# =============================================================================
+# Quan la UI (ui/runner.py) arrenca, registra un callback via configure_log_sink().
+# Cada cop que un node crida _emit(), el callback rep el missatge i el reenvia
+# a l'asyncio.Queue del GraphRunner, que la UI llegeix per actualitzar els widgets.
+#
+# Si no hi ha cap sink registrat (ús des de main.py en mode CLI), _emit() és
+# un no-op. main.py segueix funcionant sense cap canvi.
+# ---------------------------------------------------------------------------
+
+LogSink = Callable[[str, str, bool], None]
+_log_sink: Optional[LogSink] = None
+
+
+def configure_log_sink(sink: Optional[LogSink]) -> None:
+    """
+    Registra (o elimina) el callback de log de la UI.
+    Cridat per GraphRunner (ui/runner.py) en iniciar i acabar cada execució.
+    """
+    global _log_sink
+    _log_sink = sink
+
+
+def _emit(agent: str, message: str, is_error: bool = False) -> None:
+    """Envia un event al sink registrat. Si no n'hi ha, és un no-op."""
+    if _log_sink is not None:
+        _log_sink(agent, message, is_error)
 
 
 # =============================================================================
@@ -213,35 +243,42 @@ def _memory_block(ctx: str) -> str:
 FINALIZER_PROMPT = """\
 You are the Session Memory Archivist. Your sole job is to compress the entire working context of this session into a dense, self-contained memory packet.
 
-A future AI instance will read ONLY this packet to resume work. It will have zero prior context. This dump IS its context.
+TWO types of AI agents will read this dump in the future:
+  - CLAUDE:    handles complex logic, algorithms, integrations, debugging.
+  - OPENCODE:  handles boilerplate, data structures, repetitive scaffolding.
 
-Output STRICTLY inside a single <MEMORY_DUMP> ... </MEMORY_DUMP> block. Use this exact internal structure:
+Output STRICTLY inside a single <MEMORY_DUMP> ... </MEMORY_DUMP> block. Use this EXACT internal structure:
 
 [PROJECT_STATE]
-- Active files & purposes
+- Active files: <path> | purpose
 - Architecture decisions locked in
 - Unfinished / broken components
 
 [TASK_STACK]
 - Done: <list>
 - In-Progress: <list>
-- Pending: <list>
+- Pending[CLAUDE]: <tasks that need complex reasoning>
+- Pending[OPENCODE]: <tasks that are boilerplate/repetitive>
 
 [KEY_DECISIONS]
-- <decision> | Rationale: <why>
+- <decision> | Rationale: <why> | Owner: CLAUDE|OPENCODE
 
 [SCRATCHPAD]
-- Debug notes, hypotheses, dead ends worth remembering
+- Debug notes, hypotheses, dead ends, known failure modes
 
 [NEXT_ACTION]
-- The single highest-priority next step with full context
+- Target: CLAUDE|OPENCODE
+- Task: <single highest-priority next step with full context>
+- Files: <exact paths to touch>
+- Signature: <exact function/class name to create or modify>
 
 RULES:
-1. EXTREME BREVITY. Use dense shorthand, abbreviations, and bullet points.
-2. NEVER reference "above", "earlier", or "the file I mentioned". This must be 100% self-contained.
-3. Include FULL file paths and exact function / class names.
+1. EXTREME BREVITY. Dense shorthand, abbreviations, bullet points only.
+2. NEVER reference "above", "earlier", or "the file I mentioned". 100% self-contained.
+3. Include FULL file paths and exact function/class names.
 4. No markdown outside <MEMORY_DUMP>. No greetings. No summaries.
-5. If an existing memory block is provided below, MERGE and UPDATE it rather than replacing blindly.
+5. Tag every pending task with [CLAUDE] or [OPENCODE] so the router can skip reading.
+6. If an existing memory block is provided, MERGE and UPDATE — do not replace blindly.
 """
 
 
@@ -257,6 +294,36 @@ RULES:
 #                                   -> finalize_node -> END
 # ---------------------------------------------------------------------------
 
+def opencode_optimizer_node(state: AgentState):
+    """
+    NODE 0: El Traductor de Prompts (OpenCode)
+    -------------------------------------------
+    Rep el requeriment brut de l'usuari i el converteix en una especificació
+    neta i estructurada que l'Arquitecte (Kimi) pot consumir directament.
+
+    Flux de dades:
+      state['project_requirements'] (text brut de l'usuari)
+        -> OpenCode reformula
+        -> state['project_requirements'] (especificació estructurada)
+
+    Per que OpenCode i no Kimi?
+      OpenCode és el més econòmic del sistema. No té sentit gastar tokens de
+      Kimi en tasques de formatació quan OpenCode pot fer-ho igualment bé.
+    """
+    _emit("opencode", "Optimitzant prompt de l'usuari...")
+    message = (
+        "You are a prompt engineering specialist. "
+        "Rewrite the following raw user requirement into a precise, structured "
+        "software specification for an architect AI. "
+        "Use bullet points for clarity. Separate functional requirements from "
+        "technical constraints. Output ONLY the refined specification:\n\n"
+        f"{state['project_requirements']}"
+    )
+    refined = _run_opencode(message, state.get("session_id", ""))
+    _emit("opencode", "Prompt optimitzat.")
+    return {"project_requirements": refined}
+
+
 def architect_node(state: AgentState):
     """
     NODE 1: The Architect (Kimi)
@@ -271,6 +338,7 @@ def architect_node(state: AgentState):
     Returns:
         {"complexity": "simple|complexa", "current_task": "..."}
     """
+    _emit("kimi", "Analitzant requeriments (Arquitecte)...")
     memory = _memory_block(state.get("memory_context", ""))
     prompt = (
         f"You are a software Architect. Analyse this requirement: {state['project_requirements']}\n"
@@ -283,6 +351,7 @@ def architect_node(state: AgentState):
     response = _run_kimi(prompt, state.get("session_id", "")).split('\n')
     complexity = response[0].strip().lower()
     task_description = "\n".join(response[1:]).strip()
+    _emit("kimi", f"Complexitat: {complexity} | {task_description[:60]}")
     return {"complexity": complexity, "current_task": task_description}
 
 
@@ -294,6 +363,7 @@ def claude_coder_node(state: AgentState):
     Receives the refined task + memory context.
     Returns the raw code as a string.
     """
+    _emit("claude", f"Codificant tasca complexa: {state['current_task'][:60]}...")
     memory = _memory_block(state.get("memory_context", ""))
     prompt = (
         f"You are an expert software engineer. Solve this complex task and output ONLY the code:\n"
@@ -310,6 +380,7 @@ def opencode_coder_node(state: AgentState):
     Receives the refined task + memory context.
     Returns the raw code as a string.
     """
+    _emit("opencode", f"Codificant tasca simple: {state['current_task'][:60]}...")
     memory = _memory_block(state.get("memory_context", ""))
     message = (
         f"Write the code for this task, output ONLY the code:\n"
@@ -338,6 +409,7 @@ def finalize_node(state: AgentState):
       Without this step, every new python src/main.py would be a blank slate.
       With it, the Architect sees the full project history on the next run.
     """
+    _emit("kimi", "Arxivant memòria de sessió (Memory Archivist)...")
     # Truncate existing memory so we don't blow past the context window.
     # 6000 chars is a safe heuristic for most local CLI models.
     existing_memory = state.get("memory_context", "")[:6000]
@@ -363,5 +435,5 @@ def finalize_node(state: AgentState):
 
     # Persist to disk so the NEXT python run can load it.
     save_memory(state.get("session_id", "default"), dump)
-
+    _emit("kimi", "Memòria guardada al disc.")
     return {"memory_context": dump}

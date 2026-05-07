@@ -21,6 +21,14 @@ HOW TO USE MULTIPLE PROJECTS:
   .macroai_memory/<session_id>.md file, so projects never collide.
 """
 
+import sys
+from pathlib import Path
+
+# Allow running this script directly (python src/main.py) by putting the
+# project root on sys.path so that "from src.graph ..." imports resolve.
+if __name__ == "__main__" and str(Path(__file__).resolve().parent.parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from src.graph import build_graph
 from src.agents import load_memory
 

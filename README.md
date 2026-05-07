@@ -1,185 +1,188 @@
-# MultiAgent Coder: Sistema d'Orquestració amb LangGraph
+# MacroAI — Sistema d'Orquestració Multiagent
 
-Aquest projecte implementa un sistema multiagent heterogeni utilitzant **LangGraph**. Aprofita els punts forts de diferents Models de Llenguatge Gran (LLMs) per automatitzar la planificació i generació de codi de manera eficient i econòmica, delegant tasques segons la seva complexitat.
+Sistema que coordina tres agents d'IA heterogenis mitjançant **LangGraph**, automatitzant la planificació i generació de codi de forma econòmica: cada tasca es delega a l'agent òptim segons la seva complexitat.
 
-L'arquitectura actual **no requereix claus API**. En lloc de cridar serveis en núvol via SDK, invoca directament els intèrprets de línia de comandes (CLI) que ja tens instal·lats al sistema: **Kimi**, **Claude** i **OpenCode**. Això elimina quotes, latència de xarxa innecessària i la gestió de secrets.
+L'arquitectura **no requereix claus API**. Invoca directament els binaris CLI que ja tens instal·lats al sistema com a subprocessos Python. Això elimina quotes, latència de xarxa innecessària i la gestió de secrets.
 
 ---
 
-## 🏛️ Arquitectura del Sistema
+## Arquitectura del Sistema
 
-El sistema es basa en un patró de **Delegació Condicional** mitjançant un Graf d'Estats (*StateGraph*). El cicle de vida d'una petició flueix a través de l'orquestrador, es deriva al programador òptim i finalment es preserva la memòria de sessió per a execucions futures.
+### Agents i la seva modalitat d'interacció
 
-### Rol dels Agents
+| Agent | Rol | Modalitat | Comandament |
+|---|---|---|---|
+| **Kimi** | Arquitecte + Memory Archivist | **CLI exclusiu** | `kimi --quiet --afk --session <id> --prompt "..."` |
+| **Claude** | Codificador avançat | **CLI exclusiu** | `claude --print -p "..."` |
+| **OpenCode** | Optimitzador + Codificador simple | **CLI** (`opencode run`) | `opencode run "..."` |
 
-1. **L'Arquitecte (Kimi — CLI):** Llegeix el context global del projecte (incloent memòria de sessions anteriors), defineix la tasca atòmica actual i n'avalua la complexitat taxonòmica (`simple` o `complexa`). **Mai** escriu codi, només planifica.
-2. **El Programador Avançat (Claude — CLI):** S'encarrega exclusivament de tasques classificades com a `complexa`. Resol algorismes, lògica de negoci principal i integracions difícils.
-3. **El Programador Bàsic (OpenCode — CLI):** S'encarrega de tasques classificades com a `simple`. Redacta codi repetitiu, estructures de dades bàsiques i *boilerplate*.
-4. **L'Arxiver de Memòria (Kimi — CLI):** Executat sempre al final. Comprimeix tot el context de treball en un paquet dens (`<MEMORY_DUMP>`) que permet reprendre el projecte després sense perdre estat.
+**Per què CLI i no API per a Kimi i Claude?**
+Kimi i Claude no disposen d'API accessible en aquest entorn. Funcionen exclusivament com a binaris locals invocats via `subprocess.run()`. Són completament independents d'OpenCode; el codi Python és l'únic orquestrador.
 
-### Flux de l'Estat (AgentState)
+**Nota sobre l'API d'OpenCode:**
+OpenCode suporta dues modalitats:
+- `opencode run "missatge"` — CLI directe, usat per MacroAI.
+- `opencode acp --port XXXX` — servidor ACP (Agent Client Protocol); el SDK Python `acp-sdk>=1.0` permet connectar-s'hi via HTTP. Útil si es volen eliminar els cold starts en crides molt freqüents, però afegeix overhead de gestió de servidor. El CLI és suficient i més simple per a l'ús actual.
 
-Els agents es comuniquen a través d'un estat compartit estricte:
+### Nodes del pipeline (LangGraph)
+
+```
+┌───────────┐    ┌───────────┐    ┌──────────────────────┐    ┌──────────┐
+│ optimizer │ ─► │ architect │ ─► │ claude  OR  opencode  │ ─► │ finalize │
+│ (OpenCode)│    │  (Kimi)   │    │ (per complexitat)     │    │  (Kimi)  │
+└───────────┘    └───────────┘    └──────────────────────┘    └──────────┘
+```
+
+| Node | Agent | Funció |
+|---|---|---|
+| `optimizer` | OpenCode | Tradueix el requeriment brut de l'usuari a una especificació estructurada |
+| `architect` | Kimi | Planifica la tasca atòmica i classifica la complexitat (`simple` / `complexa`) |
+| `claude` | Claude | Codifica tasques `complexa`: algorismes, lògica de negoci, integracions difícils |
+| `opencode` | OpenCode | Codifica tasques `simple`: boilerplate, estructures de dades, codi repetitiu |
+| `finalize` | Kimi | Comprimeix tot el context en un `<MEMORY_DUMP>` i el desa a disc |
+
+### Estat compartit (AgentState)
+
+Els nodes es comuniquen a través d'un diccionari compartit que LangGraph passa de node en node:
 
 | Camp | Descripció |
-|------|------------|
-| `project_requirements` | Descripció general del projecte. |
-| `current_task` | La tasca atòmica deduïda per l'Arquitecte. |
-| `complexity` | Veredicte de l'Arquitecte (`simple` \| `complexa`). |
-| `generated_code` | El resultat final redactat pels programadors. |
-| `session_id` | Identificador de sessió (ex: `macroai-session`). Permet contexts paral·lels. |
-| `memory_context` | Memòria comprimida de sessions anteriors, injectada a cada prompt. |
+|---|---|
+| `project_requirements` | Requeriment de l'usuari (optimitzat pel node `optimizer`) |
+| `current_task` | Tasca atòmica decidida per l'Arquitecte |
+| `complexity` | `simple` (→ OpenCode) o `complexa` (→ Claude) |
+| `generated_code` | Codi produït pel codificador actiu |
+| `session_id` | Identificador de sessió; permet projectes paral·lels |
+| `memory_context` | Memòria comprimida de sessions anteriors |
 
-### Comunicació amb els LLMs (Subprocessos)
+### Persistència de memòria entre sessions
 
-En lloc de SDKs amb claus API, es fan crides directes als binaris CLI:
+Cada execució acaba amb el node `finalize` que demana a Kimi que produeixi un `<MEMORY_DUMP>` estructurat. El dump s'escriu a `.macroai_memory/<session_id>.md` i es carrega automàticament a la propera execució, fent el sistema **stateful** malgrat que cada crida CLI sigui un procés independent.
 
-| Agente | Crida CLI | Flag de sessió | Comportament |
-|--------|-----------|----------------|--------------|
-| **Kimi** (Arquitecte) | `kimi --quiet --afk --prompt "..."` | `--session <id>` | Missatge final només, aprovació automàtica, sessió nativa. |
-| **Claude** (Complex) | `claude --print -p "..."` | *via prompt* | Sortida no interactiva. La memòria es injecta directament al prompt perquè el CLI de Claude no exposa sessió nativa en aquesta versió. |
-| **OpenCode** (Simple) | `opencode run "missatge"` | `--session <id>` | No interactiva per defecte, sessió nativa. |
-
-### Persistència de Memòria
-
-Cada execució acaba amb un **node finalitzador** que demana a Kimi que generi un `<MEMORY_DUMP>`. Aquest paquet inclou:
-
-- `[PROJECT_STATE]` — fitxers actius, decisions d'arquitectura, components inacabats.
-- `[TASK_STACK]` — tasques fetes, en progrés i pendents.
-- `[KEY_DECISIONS]` — decisions importants amb la seva justificació.
-- `[SCRATCHPAD]` — notes de depuració, hipòtesis i callejons sense sortida.
-- `[NEXT_ACTION]` — el següent pas prioritari.
-
-El dump es desa a `.macroai_memory/<session_id>.md` i es carrega automàticament en la següent execució, fent que el sistema sigui **stateful** malgrat que cada crida CLI sigui un procés independent.
+El format del dump inclou seccions especialitzades per agent:
+- `[TASK_STACK]` amb tasques etiquetades `[CLAUDE]` o `[OPENCODE]`
+- `[NEXT_ACTION]` amb `Target`, `Files` i `Signature` explícits
 
 ---
 
-## 📂 Estructura del Projecte
+## Estructura del Projecte
 
-```text
-multiagent-coder/
-├── .github/
-│   └── workflows/
-│       └── ci.yml              # Integració contínua (Ruff, Bandit, Pytest)
+```
+MacroAI/
 ├── src/
-│   ├── agents.py               # Estat, wrappers CLI i gestió de memòria
-│   ├── graph.py                # Màquina d'estats i lògica d'enrutament
-│   └── main.py                 # Punt d'entrada amb càrrega de memòria
+│   ├── agents.py       # Estat, wrappers CLI, log sink, nodes del pipeline
+│   ├── graph.py        # StateGraph de LangGraph i lògica d'enrutament
+│   └── main.py         # Punt d'entrada CLI (sense UI)
+├── ui/
+│   ├── app.py          # MacroAIApp: layout Textual, worker async, polling de cues
+│   ├── runner.py       # GraphRunner: pont asyncio ↔ ThreadPoolExecutor
+│   └── widgets/
+│       ├── project_panel.py  # Llista de sessions, crear-ne de noves
+│       ├── log_panel.py      # Log en temps real amb colors per agent
+│       ├── state_panel.py    # Visualitzador del pipeline (nodes completats)
+│       └── result_panel.py   # Codi generat amb ressaltat de sintaxi
 ├── tests/
-│   ├── __init__.py
-│   └── test_router.py          # Proves unitàries de decisions d'enrutament
-├── .macroai_memory/            # Memòria de sessió (gitignored)
-├── .env.example                # Plantilla legacy (no necessari)
-├── .gitignore
-├── requirements.txt            # Només langgraph + langchain-core
-├── CHANGELOG.md                # Historial de canvis
-└── README.md                   # Aquest document
+│   └── test_router.py  # Proves unitàries del router de complexitat
+├── .macroai_memory/    # Memòria de sessió (gitignored)
+├── main_ui.py          # Punt d'entrada UI: python main_ui.py
+├── init.sh             # Script d'instal·lació i arrancada
+└── requirements.txt    # langgraph + langchain-core + textual
 ```
 
 ---
 
-## ⚙️ Configuració i Instal·lació
+## Instal·lació i arrancada
 
-### Requisits Previs
+### Prerequisits del sistema
 
 Assegura't de tenir instal·lats i accessibles via `$PATH`:
 
-- `kimi` — [Kimi CLI](https://www.moonshot.cn/)
-- `claude` — [Claude Code CLI](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview)
-- `opencode` — [OpenCode CLI](https://github.com/opencode-ai/opencode)
+- `kimi` — [Kimi CLI](https://moonshotai.github.io/kimi-cli/)
+- `claude` — [Claude Code CLI](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview) — `npm install -g @anthropic-ai/claude-code`
+- `opencode` — [OpenCode](https://opencode.ai) — `npm install -g opencode-ai`
+- `python3 >= 3.10`
 
-### 1. Clonar el repositori
+### Instal·lació amb init.sh (recomanat)
 
 ```bash
-git clone <URL_DEL_TEU_REPOSITORI>
-cd multiagent-coder
+chmod +x init.sh && ./init.sh
 ```
 
-### 2. Crear i Activar l'Entorn Virtual (venv)
+El script fa automàticament:
+1. Comprova que els tres CLIs siguin al PATH (atura si en falta algun)
+2. Crea i activa un entorn virtual Python a `./venv`
+3. Instal·la les dependències de `requirements.txt`
+4. Ofereix escollir entre **UI** (recomanat) i **CLI simple**
 
-**En Linux / macOS:**
+### Instal·lació manual
+
 ```bash
 python3 -m venv venv
-source venv/bin/activate
-```
-
-**En Windows:**
-```bash
-python -m venv venv
-.\venv\Scripts\activate
-```
-
-### 3. Instal·lació de Dependències
-
-Ara només es necessiten dues llibreries de LangGraph:
-
-```bash
+source venv/bin/activate        # Linux/macOS
+# o: .\venv\Scripts\activate    # Windows
 pip install -r requirements.txt
 ```
 
-Contingut de `requirements.txt`:
-```text
+### Dependències Python
+
+```
 langgraph>=0.2
 langchain-core>=0.3
+textual>=0.70
 ```
-
-> **Nota:** No calen claus API, fitxers `.env`, ni SDKs de proveïdors. Els agents consumeixen les teves sessions CLI locals ja pagades.
 
 ---
 
-## 🚀 Execució
+## Execució
 
-### Execució bàsica
+### Mode UI (recomanat)
 
 ```bash
+source venv/bin/activate
+python main_ui.py
+```
+
+La UI Textual mostra tres panells:
+- **Esquerra**: Llista de sessions (`.macroai_memory/`), creació de noves
+- **Centre**: Pipeline de progrés, camp d'entrada del requeriment, log en temps real
+- **Dreta**: Codi generat amb ressaltat de sintaxi Python
+
+Dreceres de teclat: `Ctrl+R` executar · `Ctrl+L` netejar log · `Q` sortir.
+
+### Mode CLI (minimal)
+
+```bash
+source venv/bin/activate
 python src/main.py
 ```
 
-Per defecte utilitza la sessió `macroai-session`. En la primera execució la memòria estarà buida; en execucions posteriors carregarà automàticament el context acumulat.
+Per defecte usa la sessió `macroai-session`. Edita `session_id` a `src/main.py` per treballar en sessions paral·leles.
 
-### Canviar de sessió (projectes paral·lels)
+### Projectes múltiples (sessions paral·leles)
 
-Edita `src/main.py` o passa un argument (si estàs ampliant el codi):
+Cada `session_id` té el seu propi fitxer de memòria independent:
 
-```python
-session_id = "projecte-alpha"   # o "projecte-beta", "bugfix-123", etc.
 ```
-
-Cada `session_id` té el seu propi fitxer `.macroai_memory/<session_id>.md`, així que pots treballar en múltiples projectes sense que la memòria es barregi.
-
-### Visualitzar la memòria actual
-
-```bash
-cat .macroai_memory/macroai-session.md
+.macroai_memory/
+├── macroai-session.md    # projecte principal
+├── api-refactor.md       # refactoring paral·lel
+└── bugfix-auth.md        # correcció d'error
 ```
 
 ---
 
-## 🧪 Desenvolupament, Qualitat i Proves
+## Desenvolupament i qualitat
 
-Abans de fer un *push*, executa localment dins del teu `venv`:
-
-**1. Analitzador d'Estil (Linter):**
 ```bash
-ruff check src/
-```
+# Linter
+ruff check src/ ui/
 
-**2. Anàlisi de Seguretat:**
-```bash
-bandit -r src/ -ll -ii
-```
+# Anàlisi de seguretat
+bandit -r src/ ui/ -ll -ii
 
-**3. Proves Unitàries:**
-```bash
+# Proves unitàries
 pytest tests/ -v
 ```
 
 ---
 
-## 📝 Canvis Recents
-
-Vegeu [CHANGELOG.md](./CHANGELOG.md) per a un detall complet de la migració des de l'arquitectura amb claus API fins a la nova arquitectura basada en subprocessos CLI amb memòria persistent.
-
----
-
-> *Avis de Seguretat: El directori `.macroai_memory/` està ignorat a `.gitignore`. No el puguis mai a un repositori públic si conté informació sensible del teu projecte.*
+> **Seguretat**: `.macroai_memory/` és ignorat al `.gitignore`. No el pugis mai a un repositori públic si conté informació sensible del projecte.
