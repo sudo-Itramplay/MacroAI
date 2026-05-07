@@ -121,4 +121,4 @@ Comprova la integritat de la lògica d'enrutament sense consumir quota d'API.
 pytest tests/ -v
 ```
 
-````</URL_DEL_TEU_REPOSITORI>
+````https://github.com/sudo-Itramplay/MacroAI#
