@@ -10,22 +10,24 @@ WHAT IT DOES:
      - optimizer_node   -> refines the user's raw prompt.
      - planner_node     -> creates a full project plan with [COMPLEX]/[SIMPLE] tasks.
      - executor_node    -> dispatches the next pending task to the right coder.
-     - complex_coder    -> handles complex tasks, writes to file.
-     - simple_coder     -> handles simple tasks, writes to file.
+     - complex_coder    -> handles complex tasks.
+     - simple_coder     -> handles simple tasks.
      - finalize_node    -> saves compressed memory for next run.
 
 ARCHITECTURE NOTES:
   - All agents use OpenCode CLI with different --model flags per role (SOLID DIP).
   - The planner writes plan.md to the project directory.
-  - The executor loops until all tasks are done, then routes to finalize.
-  - Each coder writes its output to the target file in the project folder.
+  - Coders pass plan.md and memory.md as -f attachments instead of inlining
+    them in the prompt — keeps the prompt small and bounded across tasks.
+  - Permission mode (Safe/Auto) controls whether opencode writes files itself
+    (Auto: native write tool) or returns code as text (Safe: executor writes).
 """
 
 import os
 import re
 from typing import Callable, Optional, TypedDict
 
-from src.clients import AgentClient
+from src.clients import AgentClient, is_auto_approve
 
 # =============================================================================
 # DIRECTORIES
@@ -33,21 +35,23 @@ from src.clients import AgentClient
 MEMORY_DIR = ".macroai_memory"
 PROJECTS_DIR = os.getenv("MACROAI_PROJECTS_DIR", os.path.join(os.getcwd(), "macroai_projects"))
 
+# Cap memory_context payload sent to coders (chars). The finalizer uses its
+# own larger cap (6000) because it merges/rewrites the dump.
+_CODER_MEMORY_CAP = 4000
+
 
 def _project_dir(session_id: str) -> str:
-    """Absolute path to the project output directory for a session."""
     return os.path.join(PROJECTS_DIR, session_id)
 
 
 def _ensure_project_dir(session_id: str) -> str:
-    """Create (if needed) and return the project output directory."""
     path = _project_dir(session_id)
     os.makedirs(path, exist_ok=True)
     return path
 
 
 # =============================================================================
-# LOG SINK -- Observability mechanism for the UI (optional)
+# LOG SINK
 # =============================================================================
 LogSink = Callable[[str, str, bool], None]
 _log_sink: Optional[LogSink] = None
@@ -64,7 +68,7 @@ def _emit(agent: str, message: str, is_error: bool = False) -> None:
 
 
 # =============================================================================
-# AgentState -- The shared notebook that every node reads and writes
+# AgentState
 # =============================================================================
 class AgentState(TypedDict, total=False):
     project_requirements: str
@@ -73,16 +77,15 @@ class AgentState(TypedDict, total=False):
     generated_code: str
     session_id: str
     memory_context: str
-    # Multi-task planning
-    plan_md: str           # Full project plan in markdown
-    task_index: int        # Current task position (0-based)
-    total_tasks: int       # Total number of tasks in the plan
-    target_file: str       # Relative path for current task's output
-    output_dir: str        # Absolute project output directory
+    plan_md: str
+    task_index: int
+    total_tasks: int
+    target_file: str
+    output_dir: str
 
 
 # =============================================================================
-# MEMORY PERSISTENCE LAYER
+# MEMORY PERSISTENCE
 # =============================================================================
 def _memory_file(session_id: str) -> str:
     os.makedirs(MEMORY_DIR, exist_ok=True)
@@ -103,23 +106,46 @@ def save_memory(session_id: str, content: str) -> None:
         f.write(content)
 
 
-# =============================================================================
-# MEMORY INJECTION HELPER
-# =============================================================================
-def _memory_block(ctx: str) -> str:
-    if not ctx or not ctx.strip():
-        return ""
-    return (
-        "\n\n--- RESUMED SESSION MEMORY ---\n"
-        f"{ctx.strip()}\n"
-        "--- END MEMORY ---\n"
-        "Treat the above memory as your active working context. "
-        "Do NOT mention you are reading a memory dump; just use the facts."
+def _write_session_memory_file(output_dir: str, memory_context: str) -> str | None:
+    """
+    Persist the session memory into the project dir as memory.md so it can
+    be passed via -f. Returns the absolute path or None if memory is empty.
+    """
+    if not memory_context or not memory_context.strip() or not output_dir:
+        return None
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "memory.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(memory_context.strip())
+    return path
+
+
+def _coder_attachments(state: "AgentState") -> list[str]:
+    """
+    Build the list of -f attachments for a coder call: plan.md and memory.md
+    (if present). Both live under output_dir.
+    """
+    output_dir = state.get("output_dir", "")
+    attachments: list[str] = []
+    if not output_dir:
+        return attachments
+
+    plan_path = os.path.join(output_dir, "plan.md")
+    if os.path.exists(plan_path):
+        attachments.append(plan_path)
+
+    memory_path = _write_session_memory_file(
+        output_dir,
+        (state.get("memory_context", "") or "")[:_CODER_MEMORY_CAP],
     )
+    if memory_path:
+        attachments.append(memory_path)
+
+    return attachments
 
 
 # =============================================================================
-# PLAN PARSER -- Extracts structured tasks from plan.md
+# PLAN PARSER
 # =============================================================================
 _PLAN_TASK_RE = re.compile(
     r'###\s*\[(COMPLEX|SIMPLE)\]\s*(.+?)\n(.*?)(?=\n###\s*\[|$)',
@@ -130,14 +156,6 @@ _DESC_RE = re.compile(r'\*\*Description\*\*:\s*(.+?)(?:\n\*\*|$)', re.DOTALL)
 
 
 def parse_plan_tasks(plan_md: str) -> list[dict]:
-    """
-    Parse a plan.md string into a list of task dicts.
-
-    Each task dict has:
-        description: str   -- what to implement
-        complexity: str    -- "complexa" or "simple"
-        target_file: str   -- relative path to write to
-    """
     tasks: list[dict] = []
     for match in _PLAN_TASK_RE.finditer(plan_md):
         complexity_raw = match.group(1).lower()
@@ -164,7 +182,6 @@ def parse_plan_tasks(plan_md: str) -> list[dict]:
 # PLAN FILE PERSISTENCE
 # =============================================================================
 def save_plan(output_dir: str, plan_md: str) -> str:
-    """Write plan.md to the project directory. Returns the full path."""
     plan_path = os.path.join(output_dir, "plan.md")
     os.makedirs(output_dir, exist_ok=True)
     with open(plan_path, "w", encoding="utf-8") as f:
@@ -173,10 +190,6 @@ def save_plan(output_dir: str, plan_md: str) -> str:
 
 
 def update_plan_task_status(plan_md: str, task_index: int, status: str) -> str:
-    """
-    Mark the nth task in the plan as done/in-progress while preserving
-    the [COMPLEX]/[SIMPLE] tag so parse_plan_tasks() still works.
-    """
     count = 0
     def _replace(m):
         nonlocal count
@@ -197,7 +210,7 @@ def update_plan_task_status(plan_md: str, task_index: int, status: str) -> str:
 
 
 # =============================================================================
-# THE FINALIZER PROMPT
+# FINALIZER PROMPT
 # =============================================================================
 FINALIZER_PROMPT = """\
 You are the Session Memory Archivist. Your sole job is to compress the entire working context of this session into a dense, self-contained memory packet.
@@ -242,9 +255,8 @@ RULES:
 
 
 # =============================================================================
-# PLANNER PROMPT -- Generates the full project plan
+# PLANNER PROMPT
 # =============================================================================
-
 PLANNER_PROMPT = """\
 You are a Senior Software Architect. Your job is to create a complete implementation plan for the following project specification.
 
@@ -290,12 +302,6 @@ RULES:
 # =============================================================================
 # GRAPH NODE FACTORIES
 # =============================================================================
-# Every node follows DIP: receives AgentClient via factory injection.
-#
-# FLOW:
-#   optimizer → planner → executor → [complex|simple] → executor (loop)
-#                        executor → finalize → END
-# ---------------------------------------------------------------------------
 
 def make_optimizer_node(client: AgentClient):
     """NODE 0: Refines raw user input into a structured spec."""
@@ -310,7 +316,7 @@ def make_optimizer_node(client: AgentClient):
             "technical constraints. Output ONLY the refined specification:\n\n"
             f"{state['project_requirements']}"
         )
-        refined = client.run(message, state.get("session_id", ""))
+        refined = client.run(message)
         _emit("optimizer", "Prompt optimitzat.")
         return {"project_requirements": refined}
 
@@ -318,34 +324,29 @@ def make_optimizer_node(client: AgentClient):
 
 
 def make_planner_node(client: AgentClient):
-    """
-    NODE 1: The Planner (replaces Architect).
-    ==========================================
-    Takes the structured spec and generates a full project plan
-    with [COMPLEX] / [SIMPLE] tasks, output directory, and file structure.
-
-    Writes plan.md to the project directory.
-    """
+    """NODE 1: Creates the full project plan with [COMPLEX]/[SIMPLE] tasks."""
 
     def planner_node(state: AgentState):
         _emit("architect", "Elaborant pla de projecte (Planner)...")
         session_id = state.get("session_id", "default")
         output_dir = _ensure_project_dir(session_id)
 
-        memory = _memory_block(state.get("memory_context", ""))
+        # Persist memory to disk so the planner reads it via -f if available.
+        memory_ctx = (state.get("memory_context", "") or "")[:_CODER_MEMORY_CAP * 2]
+        memory_path = _write_session_memory_file(output_dir, memory_ctx)
+
         prompt = (
             f"{PLANNER_PROMPT}\n\n"
             f"### PROJECT SPECIFICATION ###\n"
-            f"{state['project_requirements']}{memory}\n\n"
+            f"{state['project_requirements']}\n\n"
+            f"{'A memory.md from a prior session is attached. Use it as context. ' if memory_path else ''}"
             "Generate the complete plan now."
         )
 
-        plan_md = client.run(prompt, session_id)
+        files = [memory_path] if memory_path else None
+        plan_md = client.run(prompt, files=files)
 
-        # Save plan.md to project directory
         plan_path = save_plan(output_dir, plan_md)
-
-        # Parse tasks
         tasks = parse_plan_tasks(plan_md)
         total = len(tasks)
 
@@ -369,14 +370,14 @@ def make_planner_node(client: AgentClient):
 
 def make_executor_node():
     """
-    NODE 2: The Executor (Task Dispatcher).
-    ========================================
-    Ran BEFORE each coder and AFTER each coder (loop).
+    NODE 2: Task Dispatcher.
 
     On entry:
-      - If generated_code is present → write it to target_file, advance index.
-      - If pending tasks remain → dispatch next task (set current_task, complexity).
-      - If all tasks done → return without complexity (router goes to finalize).
+      - If generated_code is present (Safe mode coder return) → write it.
+        In Auto mode coders write the file themselves, so generated_code is
+        empty and this branch is skipped.
+      - Mark the previous task done in plan.md, advance index.
+      - Dispatch next task or fall through to finalize.
     """
 
     def executor_node(state: AgentState):
@@ -386,22 +387,28 @@ def make_executor_node():
         target = state.get("target_file", "")
         output_dir = state.get("output_dir", "")
         plan_md = state.get("plan_md", "")
+        had_active_task = bool(target) and task_index < total_tasks
 
-        # --- Write file if we just came from a coder ---
+        # Safe mode: coder returned code text, executor writes it.
         if generated and target and output_dir:
             file_path = os.path.join(output_dir, target)
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            os.makedirs(os.path.dirname(file_path) or output_dir, exist_ok=True)
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(generated)
             _emit("system", f"Escrit: {target} ({len(generated)} chars)")
 
-            # Mark task as done in plan.md (keeps [COMPLEX]/[SIMPLE] tag)
+        # Advance the task index whenever we just came back from a coder.
+        # (Auto mode: no generated_code, but the coder still ran — detected
+        # by the presence of an active target_file.)
+        if had_active_task:
             updated = update_plan_task_status(plan_md, task_index, "done")
             save_plan(output_dir, updated)
             plan_md = updated
             task_index += 1
+            if not generated:
+                _emit("system", f"Tasca {target} completada (Auto mode).")
 
-        # --- Dispatch next task (or finish) ---
+        # Dispatch next task
         if task_index < total_tasks:
             tasks = parse_plan_tasks(plan_md)
             if task_index < len(tasks):
@@ -424,85 +431,91 @@ def make_executor_node():
             "task_index": task_index,
             "plan_md": plan_md,
             "generated_code": "",
+            "target_file": "",
+            "complexity": "",
         }
 
     return executor_node
 
 
+def _coder_prompt(task: str, target: str, output_dir: str, complexity_label: str) -> str:
+    """Build the per-call coder prompt. Auto mode tells opencode to write the
+    file with its native tool; Safe mode asks for raw code via stdout."""
+    if is_auto_approve():
+        return (
+            f"Implement this {complexity_label} task by writing the code to "
+            f"`{target}` using your write tool.\n\n"
+            f"TASK: {task}\n"
+            f"TARGET FILE (relative to project root): {target}\n"
+            f"PROJECT ROOT: {output_dir}\n\n"
+            "The attached `plan.md` is the full project plan; `memory.md` (if "
+            "attached) is prior session context. Read them as needed.\n\n"
+            "Include ALL imports, type hints and minimal docstrings. Production-ready code. "
+            "When the file is written, reply with just 'done'."
+        )
+    return (
+        f"Implement this {complexity_label} task.\n\n"
+        f"TASK: {task}\n"
+        f"TARGET FILE: {target}\n"
+        f"PROJECT DIRECTORY: {output_dir}\n\n"
+        "The attached `plan.md` is the full project plan; `memory.md` (if "
+        "attached) is prior session context. Read them as needed.\n\n"
+        "Output ONLY the complete, production-ready code for this file. "
+        "Include ALL imports, type hints and docstrings. "
+        "No explanations, no markdown fences — just the raw code."
+    )
+
+
 def make_complex_coder_node(client: AgentClient):
-    """
-    NODE 3A: The Complex Coder.
-    ============================
-    Handles [COMPLEX] tasks: algorithms, business logic, integrations.
-    Receives exact task description, target file, and project context.
-    """
+    """NODE 3A: Complex Coder. Algorithms, business logic, integrations."""
 
     def complex_coder_node(state: AgentState):
         task = state.get("current_task", "")
         target = state.get("target_file", "")
         output_dir = state.get("output_dir", "")
-        memory = _memory_block(state.get("memory_context", ""))
 
         _emit("complex", f"Codificant [COMPLEX]: {task[:60]}...")
-        prompt = (
-            f"You are an expert software engineer. Implement this COMPLEX task.\n\n"
-            f"TASK: {task}\n"
-            f"TARGET FILE: {target}\n"
-            f"PROJECT DIRECTORY: {output_dir}\n"
-            f"{memory}\n"
-            f"Output ONLY the complete, production-ready code for this file. "
-            f"Include ALL imports, type hints, docstrings, and error handling. "
-            f"No explanations, no markdown fences — just the raw code."
-        )
-        code = client.run(prompt, state.get("session_id", ""))
+        prompt = _coder_prompt(task, target, output_dir, "COMPLEX")
+        files = _coder_attachments(state)
+
+        response = client.run(prompt, files=files, cwd=output_dir or None)
         _emit("complex", f"Completat: {target}")
-        return {"generated_code": code}
+
+        # Auto mode: opencode wrote the file; don't echo the response as code.
+        generated = "" if is_auto_approve() else response
+        return {"generated_code": generated}
 
     return complex_coder_node
 
 
 def make_simple_coder_node(client: AgentClient):
-    """
-    NODE 3B: The Simple Coder.
-    ===========================
-    Handles [SIMPLE] tasks: data classes, config, boilerplate, scaffolding.
-    """
+    """NODE 3B: Simple Coder. Data classes, config, boilerplate."""
 
     def simple_coder_node(state: AgentState):
         task = state.get("current_task", "")
         target = state.get("target_file", "")
         output_dir = state.get("output_dir", "")
-        memory = _memory_block(state.get("memory_context", ""))
 
         _emit("simple", f"Codificant [SIMPLE]: {task[:60]}...")
-        message = (
-            f"Implement this SIMPLE task.\n\n"
-            f"TASK: {task}\n"
-            f"TARGET FILE: {target}\n"
-            f"PROJECT DIRECTORY: {output_dir}\n"
-            f"{memory}\n"
-            f"Output ONLY the complete code for this file. "
-            f"Include ALL imports and type hints. "
-            f"No explanations, no markdown fences — just the raw code."
-        )
-        code = client.run(message, state.get("session_id", ""))
+        prompt = _coder_prompt(task, target, output_dir, "SIMPLE")
+        files = _coder_attachments(state)
+
+        response = client.run(prompt, files=files, cwd=output_dir or None)
         _emit("simple", f"Completat: {target}")
-        return {"generated_code": code}
+
+        generated = "" if is_auto_approve() else response
+        return {"generated_code": generated}
 
     return simple_coder_node
 
 
 def make_finalize_node(client: AgentClient):
-    """
-    NODE 4: The Memory Archivist.
-    ==============================
-    Runs AFTER all tasks complete. Compresses session into memory dump.
-    """
+    """NODE 4: Memory Archivist. Compresses session into memory dump."""
 
     def finalize_node(state: AgentState):
         _emit("finalizer", "Arxivant memoria de sessio...")
-        existing_memory = state.get("memory_context", "")[:6000]
-        plan_md = state.get("plan_md", "")[:2000]
+        existing_memory = (state.get("memory_context", "") or "")[:6000]
+        plan_md = (state.get("plan_md", "") or "")[:2000]
 
         prompt = (
             f"{FINALIZER_PROMPT}\n\n"
@@ -514,7 +527,7 @@ def make_finalize_node(client: AgentClient):
             "Produce the updated <MEMORY_DUMP>."
         )
 
-        response = client.run(prompt, state.get("session_id", ""))
+        response = client.run(prompt)
 
         match = re.search(r'<MEMORY_DUMP>(.*?)</MEMORY_DUMP>', response, re.DOTALL)
         dump = match.group(1).strip() if match else response

@@ -8,7 +8,7 @@ SOLID MAP:
   O (OCP)  -> AgentFactory is open for extension (new roles/models) but closed
                for modification (existing roles never break).
   L (LSP)  -> Any AgentClient implementation can substitute another transparently.
-  I (ISP)  -> AgentClient exposes only what nodes need: run(prompt, session_id).
+  I (ISP)  -> AgentClient exposes only what nodes need: run(prompt, ...).
   D (DIP)  -> Graph nodes depend on the AgentClient abstraction, not on concrete
                CLI wrappers. build_graph() receives clients via DI.
 
@@ -18,49 +18,88 @@ ARCHITECTURE:
 
   AgentFactory            <-- creates configured clients per role (optimizer,
                                architect, complex_coder, simple_coder, finalizer)
+
+PERMISSION MODES (Safe / Auto):
+  Safe (default) -> opencode runs without --dangerously-skip-permissions.
+                    Coders return code as text; the executor writes the file.
+  Auto           -> opencode is given --dangerously-skip-permissions and may
+                    use its native write tool to modify files directly.
+                    Toggled at runtime via set_auto_approve(True).
+
+NO --continue:
+  Each call is independent. Context the model needs (plan, memory, prior code)
+  is passed via -f file attachments at call time. This keeps prompts bounded
+  and prevents the unbounded session-history growth that caused timeouts.
 """
 
 import os
 import re
 import subprocess
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import ClassVar
+
+
+# Runtime permission mode. Default Safe. Toggled by the UI (or tests).
+_auto_approve: bool = False
+
+
+def set_auto_approve(value: bool) -> None:
+    """Enable/disable opencode's --dangerously-skip-permissions for new calls."""
+    global _auto_approve
+    _auto_approve = bool(value)
+
+
+def is_auto_approve() -> bool:
+    """Current permission mode. True = Auto (auto-approve), False = Safe."""
+    return _auto_approve
 
 
 def _strip_ansi(text: str) -> str:
     """Remove terminal color codes from CLI output."""
-    return re.sub(r'\x1b\[[0-9;]*[mGKHF]', '', text)
+    return re.sub(r"\x1b\[[0-9;]*[mGKHF]", "", text)
+
+
+def _resolve_timeout(override: int | None) -> int:
+    """Return the effective timeout: explicit override, env var, or default 600."""
+    if override is not None:
+        return override
+    try:
+        return int(os.getenv("MACROAI_TIMEOUT", "600"))
+    except (ValueError, TypeError):
+        return 600
 
 
 # =============================================================================
 # AGENT CLIENT INTERFACE  (Dependency Inversion Principle)
 # =============================================================================
-# Nodes depend on this abstraction, never on concrete CLI wrappers.
-# -----------------------------------------------------------------------------
+
 
 class AgentClient(ABC):
-    """
-    Interface for AI agent clients.
-
-    Every agent in the system (architect, coder, optimizer, finalizer)
-    communicates through this single-method contract.
-    """
+    """Interface for AI agent clients."""
 
     @abstractmethod
-    def run(self, prompt: str, session_id: str = "") -> str:
+    def run(
+        self,
+        prompt: str,
+        session_id: str = "",
+        files: list[str] | None = None,
+        cwd: str | None = None,
+    ) -> str:
         """
         Execute a prompt and return the plain-text response.
 
         Args:
             prompt:     The full prompt text to send.
-            session_id: Optional session ID for continuity across calls.
+            session_id: Reserved for future use (currently unused — see module docstring).
+            files:      Optional file paths to attach via opencode's -f flag.
+            cwd:        Optional working directory for opencode (--dir).
 
         Returns:
             The agent's response as a clean string.
 
         Raises:
-            RuntimeError: If the underlying subprocess fails.
+            RuntimeError: If the underlying subprocess fails or times out.
         """
         ...
 
@@ -68,45 +107,69 @@ class AgentClient(ABC):
 # =============================================================================
 # OPENCODE CLIENT  (Single Responsibility Principle)
 # =============================================================================
-# Wraps ONE CLI tool (opencode). Model selection is a constructor parameter,
-# not a separate implementation. This keeps the class focused and simple.
-# -----------------------------------------------------------------------------
+
 
 class OpenCodeClient(AgentClient):
     """
     Concrete agent client backed by the opencode CLI.
 
-    Supports any model available in the opencode configuration via the
-    `--model` flag (format: provider/model, e.g. 'opencode-go/deepseek-v4-pro').
+    Each call is a fresh `opencode run` invocation. Context the model needs
+    must be passed in the prompt or via the `files` parameter (-f attachments).
     """
 
-    def __init__(self, model: str, timeout: int = 180) -> None:
+    def __init__(
+        self,
+        model: str,
+        timeout: int | None = None,
+        variant: str = "",
+    ) -> None:
         self._model = model
-        self._timeout = timeout
+        self._timeout = _resolve_timeout(timeout)
+        self._variant = variant
 
     @property
     def model(self) -> str:
-        """The model identifier used by this client (provider/model format)."""
         return self._model
 
-    def run(self, prompt: str, session_id: str = "") -> str:
-        """
-        Spawn `opencode run --model <model>` and return clean stdout.
+    @property
+    def variant(self) -> str:
+        return self._variant
 
-        NOTE: We intentionally do NOT pass --session to opencode.
-        The --session flag requires an existing opencode session ID
-        (e.g. 'ses_abc123'), not a custom string. Passing a custom ID
-        like "macroai-session" causes "Session not found" errors.
+    def run(
+        self,
+        prompt: str,
+        session_id: str = "",
+        files: list[str] | None = None,
+        cwd: str | None = None,
+    ) -> str:
+        """Spawn `opencode run` and return clean stdout."""
+        cmd: list[str] = ["opencode", "run", "--model", self._model]
 
-        Cross-call continuity is handled by MacroAI's own memory system:
-        _memory_block() injects previous context into every prompt.
-        """
-        cmd = ["opencode", "run", "--model", self._model]
+        if self._variant:
+            cmd.extend(["--variant", self._variant])
+
+        if cwd:
+            cmd.extend(["--dir", cwd])
+
+        if is_auto_approve():
+            cmd.append("--dangerously-skip-permissions")
+
+        for path in files or []:
+            if path and os.path.exists(path):
+                cmd.extend(["-f", path])
+
         cmd.append(prompt)
 
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=self._timeout
-        )
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=self._timeout
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"OpenCode[{self._model}] timeout after {self._timeout}s. "
+                f"Increase MACROAI_TIMEOUT (env var) or use a faster model."
+            )
+
         if result.returncode != 0:
             raise RuntimeError(
                 f"OpenCode[{self._model}] error: {result.stderr.strip()}"
@@ -118,13 +181,11 @@ class OpenCodeClient(AgentClient):
 # MODEL CONFIG  (Value Object)
 # =============================================================================
 
+
 @dataclass(frozen=True)
 class ModelConfig:
     """
     Immutable configuration mapping roles to opencode model identifiers.
-
-    All model identifiers use the `provider/model` format expected by the
-    opencode CLI (e.g. 'opencode-go/deepseek-v4-pro').
 
     Environment variables override defaults:
       MACROAI_OPTIMIZER_MODEL, MACROAI_ARCHITECT_MODEL,
@@ -133,10 +194,10 @@ class ModelConfig:
     """
 
     optimizer: str = "opencode-go/deepseek-v4-flash"
-    architect: str = "opencode-go/deepseek-v4-pro"
-    complex_coder: str = "opencode-go/deepseek-v4-pro"
+    architect: str = "opencode-go/mimo-v2.5-pro"
+    complex_coder: str = "opencode-go/mimo-v2.5-pro"
     simple_coder: str = "opencode-go/deepseek-v4-flash"
-    finalizer: str = "opencode-go/deepseek-v4-pro"
+    finalizer: str = "opencode-go/kimi-K2.6"
 
     _ENV_MAP: ClassVar[dict[str, str]] = {
         "MACROAI_OPTIMIZER_MODEL": "optimizer",
@@ -148,14 +209,12 @@ class ModelConfig:
 
     @classmethod
     def from_env(cls) -> "ModelConfig":
-        """Create a ModelConfig, overriding defaults from environment variables."""
         overrides: dict[str, str] = {}
         for env_var, field_name in cls._ENV_MAP.items():
             value = os.getenv(env_var)
             if value:
                 overrides[field_name] = value
         if overrides:
-            # Use dataclass replace-like pattern via constructor
             defaults = {
                 "optimizer": cls.optimizer,
                 "architect": cls.architect,
@@ -171,19 +230,15 @@ class ModelConfig:
 # =============================================================================
 # AGENT FACTORY  (Open/Closed Principle)
 # =============================================================================
-# Creates AgentClient instances per role. To add a new role or swap a model,
-# extend the config or factory method — no existing code changes.
-# -----------------------------------------------------------------------------
+
 
 class AgentFactory:
     """
     Factory for creating fully-wired AgentClient instances per role.
 
-    Usage:
-        factory = AgentFactory()
-        optimizer = factory.create_optimizer()
-        architect = factory.create_architect()
-        ...
+    Roles tagged "fast" (optimizer, simple_coder) get --variant minimal so the
+    model spends less effort on reasoning. Roles handling architecture or
+    complex code get full reasoning effort.
     """
 
     def __init__(self, config: ModelConfig | None = None) -> None:
@@ -194,21 +249,16 @@ class AgentFactory:
         return self._config
 
     def create_optimizer(self) -> AgentClient:
-        """Client for the optimizer node (prompt refinement)."""
-        return OpenCodeClient(model=self._config.optimizer)
+        return OpenCodeClient(model=self._config.optimizer, variant="minimal")
 
     def create_architect(self) -> AgentClient:
-        """Client for the architect node (task planning & complexity classification)."""
         return OpenCodeClient(model=self._config.architect)
 
     def create_complex_coder(self) -> AgentClient:
-        """Client for complex tasks (algorithms, business logic, integrations)."""
         return OpenCodeClient(model=self._config.complex_coder)
 
     def create_simple_coder(self) -> AgentClient:
-        """Client for simple tasks (boilerplate, data structures, scaffolding)."""
-        return OpenCodeClient(model=self._config.simple_coder)
+        return OpenCodeClient(model=self._config.simple_coder, variant="minimal")
 
     def create_finalizer(self) -> AgentClient:
-        """Client for the finalizer node (session memory archival)."""
         return OpenCodeClient(model=self._config.finalizer)

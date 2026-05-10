@@ -68,11 +68,27 @@ Only one `GraphRunner` can register a sink at a time. `configure_log_sink(None)`
 **`update_plan_task_status()` preserves `[COMPLEX]`/`[SIMPLE]` tags.**
 It adds a `✅` marker but keeps the tag so `parse_plan_tasks()` still finds the task. If you break this, the executor loop will think fewer tasks exist and exit early.
 
-**`subprocess.TimeoutExpired` is not caught in `OpenCodeClient.run()`.**
-The 180s timeout raises `subprocess.TimeoutExpired` which propagates as a generic exception. `GraphRunner` catches it broadly. If you need specific error messages, catch it in `run()`.
+**`subprocess.TimeoutExpired` is now caught in `OpenCodeClient.run()`.**
+A clear error with the model name and duration is raised. Default timeout is 600s, configurable via `MACROAI_TIMEOUT`.
+
+**`--continue` is NOT used.**
+Each `opencode run` is independent. Carrying conversation history across all coder calls via `--continue` caused unbounded context growth (50K+ tokens by task 5–10) and timeouts. Context the coders need is now passed via `-f plan.md` and `-f memory.md` at call time (see `_coder_attachments` in `agents.py`).
 
 **`--session` is NOT passed to opencode CLI.**
-The opencode `--session` flag requires an existing session ID (`ses_abc123`), not a custom string. Passing `"macroai-session"` causes "Session not found". Cross-call continuity is handled by MacroAI's memory system (`_memory_block()`), not opencode's native sessions.
+The opencode `--session` flag requires an existing session ID (`ses_abc123`), not a custom string. Cross-call continuity is handled by MacroAI's memory system (`memory.md` + plan attachments), not opencode's native sessions.
+
+**Permission modes: Safe (default) vs Auto.**
+Toggled at runtime via `set_auto_approve(bool)` in `clients.py`, surfaced in the UI by the `a` keybinding and the `[SAFE]/[AUTO]` indicator in the StatePanel/subtitle.
+- **Safe**: opencode runs without `--dangerously-skip-permissions`. Coders return code as text; the executor writes the file. Fully headless, no permission prompts.
+- **Auto**: opencode receives `--dangerously-skip-permissions` and `--dir <output_dir>`. Coders are told to use opencode's native write tool; the prompt asks for `'done'` as the response. Faster (smaller responses) but trusts opencode to not touch anything outside `output_dir`.
+
+The mode resets to Safe on every UI start (no persistence). Coders pick the right prompt via `is_auto_approve()` in `agents.py:_coder_prompt`; the executor only writes a file when `generated_code` is non-empty (i.e. Safe mode).
+
+**`--variant minimal` on fast roles.**
+`AgentFactory.create_optimizer()` and `create_simple_coder()` set `variant="minimal"` for lower reasoning effort on simple tasks. Architect, complex coder, and finalizer get full reasoning.
+
+**memory.md is regenerated each call.**
+`_write_session_memory_file()` writes the (truncated, 4000-char) memory dump into `output_dir/memory.md` before each coder call so opencode can read it via `-f`. The canonical store is still `.macroai_memory/<session>.md` — `output_dir/memory.md` is just a per-call reflection.
 
 ## SOLID Map
 
@@ -97,6 +113,16 @@ Environment variables (`.env` or shell):
 | `MACROAI_SIMPLE_MODEL` | `opencode-go/deepseek-v4-flash` | Fast model for simple tasks |
 | `MACROAI_FINALIZER_MODEL` | `opencode-go/deepseek-v4-pro` | Powerful model for memory archival |
 | `MACROAI_PROJECTS_DIR` | `./macroai_projects` | Base directory for generated project files |
+| `MACROAI_TIMEOUT` | `600` | Max seconds per opencode call (increase if tasks time out) |
+
+### UI keybindings
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+R` | Run the graph with the current input |
+| `Ctrl+L` | Clear the log panel |
+| `a` | Toggle Safe/Auto permission mode |
+| `Q` | Quit |
 
 Model format: `provider/model` (e.g. `opencode-go/deepseek-v4-pro`). List available models with `opencode models`.
 

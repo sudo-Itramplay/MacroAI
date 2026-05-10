@@ -1,0 +1,1 @@
+Done. `src/hooks/useLocalStorage.js` written with lazy `JSON.parse` on mount, `JSON.stringify` on set, and try-catch fallback to `initialValue` for both parse errors and `Storage` quota errors.

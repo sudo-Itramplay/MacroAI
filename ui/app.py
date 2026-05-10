@@ -42,6 +42,7 @@ from textual.widgets import Header, Footer, Input, Button, Label
 from textual.containers import Horizontal, Vertical
 from textual import on, work
 
+from src.clients import is_auto_approve, set_auto_approve
 from ui.runner import GraphRunner, LogEntry, StateSnapshot
 from ui.widgets import ProjectPanel, LogPanel, StatePanel, ResultPanel
 
@@ -72,7 +73,7 @@ class MacroAIApp(App):
 
     StatePanel {
         height: auto;
-        max-height: 9;
+        max-height: 11;
         border-bottom: solid $primary-darken-2;
     }
 
@@ -116,6 +117,7 @@ class MacroAIApp(App):
     BINDINGS = [
         ("ctrl+r", "run_graph", "Executar"),
         ("ctrl+l", "clear_log", "Netejar log"),
+        ("a", "toggle_mode", "Safe/Auto"),
         ("q", "quit", "Sortir"),
     ]
 
@@ -147,8 +149,14 @@ class MacroAIApp(App):
 
     def on_mount(self) -> None:
         self._update_subtitle()
+        # Always start in Safe mode (no persistence between runs).
+        set_auto_approve(False)
+        self.query_one(StatePanel).set_mode(False)
         self.query_one(LogPanel).add_system(
             "Benvingut a MacroAI. Selecciona una sessio i introdueix un requeriment."
+        )
+        self.query_one(LogPanel).add_system(
+            "Mode actual: SAFE. Premsa 'a' per togglejar a AUTO."
         )
 
     # ------------------------------------------------------------------
@@ -196,6 +204,22 @@ class MacroAIApp(App):
 
     def action_clear_log(self) -> None:
         self.query_one(LogPanel).clear_log()
+
+    def action_toggle_mode(self) -> None:
+        """Toggle between Safe and Auto permission modes."""
+        if self.runner.is_running:
+            self.query_one(LogPanel).add_system(
+                "No es pot canviar el mode mentre el graf corre.",
+                is_error=True,
+            )
+            return
+        new_value = not is_auto_approve()
+        set_auto_approve(new_value)
+        self.query_one(StatePanel).set_mode(new_value)
+        label = "AUTO" if new_value else "SAFE"
+        warn = "  (opencode escriura fitxers directament)" if new_value else ""
+        self.query_one(LogPanel).add_system(f"Mode canviat a {label}.{warn}")
+        self._update_subtitle()
 
     # ------------------------------------------------------------------
     # Worker principal (execucio asincrona del graf)
@@ -289,7 +313,8 @@ class MacroAIApp(App):
     # ------------------------------------------------------------------
 
     def _update_subtitle(self) -> None:
-        self.sub_title = f"sessio: {self._selected_session}"
+        mode = "AUTO" if is_auto_approve() else "SAFE"
+        self.sub_title = f"[{mode}]  sessio: {self._selected_session}"
 
     def on_unmount(self) -> None:
         """Alliberem el thread pool en tancar l'aplicacio."""

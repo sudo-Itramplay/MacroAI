@@ -54,12 +54,25 @@ class StatePanel(Widget):
     def compose(self) -> ComposeResult:
         yield Label("PIPELINE", classes="panel-title")
         yield Static("", id="pipeline-bar", markup=True)
+        yield Static("Mode: —", id="mode-field", classes="state-field", markup=True)
         yield Static("Progres: —", id="progress-field", classes="state-field", markup=True)
         yield Static("Tasca: —", id="task-field", classes="state-field", markup=True)
         yield Static("Fitxer: —", id="file-field", classes="state-field", markup=True)
 
+    def set_mode(self, auto: bool) -> None:
+        """Update the Safe/Auto indicator."""
+        if auto:
+            text = "Mode: [bold red]AUTO[/bold red]  (opencode pot escriure fitxers directament)"
+        else:
+            text = "Mode: [bold green]SAFE[/bold green]  (executor escriu els fitxers)"
+        try:
+            self.query_one("#mode-field", Static).update(text)
+        except Exception:
+            pass
+
     def on_mount(self) -> None:
         self._render_pipeline()
+        self.set_mode(False)
 
     def _render_pipeline(self) -> None:
         parts: list[str] = []
