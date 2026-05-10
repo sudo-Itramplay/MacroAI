@@ -1,105 +1,95 @@
 """
 src/agents.py
 =============
-This module contains the HEART of the multi-agent system.
+Core of the multi-agent system with multi-task planning support.
 
 WHAT IT DOES:
-  1. Defines AgentState    -> the shared data structure that passes through the graph.
-  2. Wraps CLI tools       -> runs Kimi, Claude, and OpenCode as subprocesses.
-  3. Manages session memory-> saves/loads compressed memory so the AI feels "stateful"
-                              even though every call is a fresh subprocess.
-  4. Implements the nodes  -> architect_node, claude_coder_node, opencode_coder_node,
-                              and the special finalize_node that dumps memory.
+  1. Defines AgentState with task queue, plan, and output directory fields.
+  2. Manages session memory and project output directories.
+  3. Implements the nodes:
+     - optimizer_node   -> refines the user's raw prompt.
+     - planner_node     -> creates a full project plan with [COMPLEX]/[SIMPLE] tasks.
+     - executor_node    -> dispatches the next pending task to the right coder.
+     - complex_coder    -> handles complex tasks, writes to file.
+     - simple_coder     -> handles simple tasks, writes to file.
+     - finalize_node    -> saves compressed memory for next run.
 
 ARCHITECTURE NOTES:
-  - We do NOT use API keys or cloud SDKs. Each agent is just a local CLI binary
-    spawned via Python's subprocess module.
-  - Because every subprocess starts fresh, we inject "memory_context" into every
-    prompt. This lets the agents "remember" what happened in previous runs.
-  - Kimi and OpenCode support native --session flags, so the CLI itself can also
-    keep its own internal continuity. Claude gets memory injected via prompt.
+  - All agents use OpenCode CLI with different --model flags per role (SOLID DIP).
+  - The planner writes plan.md to the project directory.
+  - The executor loops until all tasks are done, then routes to finalize.
+  - Each coder writes its output to the target file in the project folder.
 """
 
 import os
 import re
-import subprocess
 from typing import Callable, Optional, TypedDict
 
+from src.clients import AgentClient
 
 # =============================================================================
-# MEMORY PERSISTENCE LAYER
+# DIRECTORIES
 # =============================================================================
-# Every session gets its own .md file inside this folder.
-# The gitignore keeps these out of the repo so you don't leak project details.
-# ---------------------------------------------------------------------------
 MEMORY_DIR = ".macroai_memory"
+PROJECTS_DIR = os.getenv("MACROAI_PROJECTS_DIR", os.path.join(os.getcwd(), "macroai_projects"))
+
+
+def _project_dir(session_id: str) -> str:
+    """Absolute path to the project output directory for a session."""
+    return os.path.join(PROJECTS_DIR, session_id)
+
+
+def _ensure_project_dir(session_id: str) -> str:
+    """Create (if needed) and return the project output directory."""
+    path = _project_dir(session_id)
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 # =============================================================================
-# LOG SINK  --  Mecanisme d'observabilitat per a la UI (opcional)
+# LOG SINK -- Observability mechanism for the UI (optional)
 # =============================================================================
-# Quan la UI (ui/runner.py) arrenca, registra un callback via configure_log_sink().
-# Cada cop que un node crida _emit(), el callback rep el missatge i el reenvia
-# a l'asyncio.Queue del GraphRunner, que la UI llegeix per actualitzar els widgets.
-#
-# Si no hi ha cap sink registrat (ús des de main.py en mode CLI), _emit() és
-# un no-op. main.py segueix funcionant sense cap canvi.
-# ---------------------------------------------------------------------------
-
 LogSink = Callable[[str, str, bool], None]
 _log_sink: Optional[LogSink] = None
 
 
 def configure_log_sink(sink: Optional[LogSink]) -> None:
-    """
-    Registra (o elimina) el callback de log de la UI.
-    Cridat per GraphRunner (ui/runner.py) en iniciar i acabar cada execució.
-    """
     global _log_sink
     _log_sink = sink
 
 
 def _emit(agent: str, message: str, is_error: bool = False) -> None:
-    """Envia un event al sink registrat. Si no n'hi ha, és un no-op."""
     if _log_sink is not None:
         _log_sink(agent, message, is_error)
 
 
 # =============================================================================
-# AgentState  --  The "shared notebook" that every node reads and writes
+# AgentState -- The shared notebook that every node reads and writes
 # =============================================================================
-# LangGraph passes this dict from node to node. Each node returns a partial
-# dict with only the keys it wants to update. The graph merges them automatically.
-#
-# Fields:
-#   project_requirements  --  High-level description of what the user wants.
-#   current_task          --  The atomic task the Architect decided to tackle NOW.
-#   complexity            --  'simple' -> OpenCode, 'complexa' -> Claude.
-#   generated_code        --  The code produced by whichever coder ran.
-#   session_id            --  Human-readable ID for this project thread.
-#   memory_context        --  Compressed text dump from previous runs (the "brain").
-# ---------------------------------------------------------------------------
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     project_requirements: str
     current_task: str
     complexity: str
     generated_code: str
     session_id: str
     memory_context: str
+    # Multi-task planning
+    plan_md: str           # Full project plan in markdown
+    task_index: int        # Current task position (0-based)
+    total_tasks: int       # Total number of tasks in the plan
+    target_file: str       # Relative path for current task's output
+    output_dir: str        # Absolute project output directory
 
 
+# =============================================================================
+# MEMORY PERSISTENCE LAYER
+# =============================================================================
 def _memory_file(session_id: str) -> str:
-    """Return the full filesystem path for a session's memory file."""
-    os.makedirs(MEMORY_DIR, exist_ok=True)   # lazy-create the folder on first use
+    os.makedirs(MEMORY_DIR, exist_ok=True)
     return os.path.join(MEMORY_DIR, f"{session_id}.md")
 
 
 def load_memory(session_id: str) -> str:
-    """
-    Load the previously-saved memory dump for a given session.
-    Returns empty string if this is the very first run (no file yet).
-    Called by main.py before the graph starts.
-    """
     path = _memory_file(session_id)
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
@@ -108,116 +98,15 @@ def load_memory(session_id: str) -> str:
 
 
 def save_memory(session_id: str, content: str) -> None:
-    """
-    Persist the compressed memory dump to disk.
-    Called by finalize_node at the very end of every run.
-    """
     path = _memory_file(session_id)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
 
 
 # =============================================================================
-# HELPERS
-# =============================================================================
-
-def _strip_ansi(text: str) -> str:
-    """
-    Remove terminal color codes from CLI output.
-    Tools like Kimi and OpenCode sometimes print ANSI escape sequences
-    (\x1b[32m...\x1b[0m) even in --quiet mode. We strip them so downstream
-    code sees clean plain text.
-    """
-    return re.sub(r'\x1b\[[0-9;]*[mGKHF]', '', text)
-
-
-# =============================================================================
-# SUBPROCESS WRAPPERS  --  One per CLI tool
-# =============================================================================
-# Each function builds the correct command-line arguments, runs the binary,
-# checks for errors, and returns the stdout as a clean string.
-#
-# DESIGN CHOICE: subprocess.run instead of API clients
-#   Pros: No API keys, no rate limits, no network latency to cloud endpoints,
-#         uses your existing paid CLI subscriptions.
-#   Cons: Each call is a cold start; we mitigate that with session --flags
-#         and by injecting memory_context into every prompt.
-# ---------------------------------------------------------------------------
-
-def _run_kimi(prompt: str, session_id: str = "") -> str:
-    """
-    Spawn the Kimi CLI (Moonshot) in quiet, auto-approve mode.
-
-    Args:
-        prompt:     The full text prompt to send.
-        session_id: If provided, adds --session <id> so Kimi internally
-                    resumes its own native session (keeps its own continuity).
-    """
-    cmd = ["kimi", "--quiet", "--afk"]
-    if session_id:
-        cmd.extend(["--session", session_id])
-    cmd.extend(["--prompt", prompt])
-
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-    if result.returncode != 0:
-        raise RuntimeError(f"Kimi error: {result.stderr.strip()}")
-    return _strip_ansi(result.stdout).strip()
-
-
-def _run_claude(prompt: str, session_id: str = "") -> str:
-    """
-    Spawn the Claude CLI in non-interactive print mode.
-
-    NOTE ON session_id:
-        Claude's CLI does not expose a --session flag in this wrapper,
-        so session continuity is achieved purely by injecting the
-        memory_context string directly into the prompt text.
-    """
-    result = subprocess.run(
-        ["claude", "--print", "-p", prompt],
-        capture_output=True, text=True, timeout=180
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Claude error: {result.stderr.strip()}")
-    return result.stdout.strip()
-
-
-def _run_opencode(message: str, session_id: str = "") -> str:
-    """
-    Spawn the OpenCode CLI in non-interactive run mode.
-
-    Args:
-        message:    The user message / prompt.
-        session_id: If provided, adds --session <id> for native continuity.
-    """
-    cmd = ["opencode", "run"]
-    if session_id:
-        cmd.extend(["--session", session_id])
-    cmd.append(message)
-
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-    if result.returncode != 0:
-        raise RuntimeError(f"OpenCode error: {result.stderr.strip()}")
-    return _strip_ansi(result.stdout).strip()
-
-
-# =============================================================================
 # MEMORY INJECTION HELPER
 # =============================================================================
-# This is the "glue" that makes stateless subprocesses feel stateful.
-# We take the raw memory dump (a big block of text) and wrap it in a
-# standardized preamble. Then we append that preamble to EVERY prompt.
-#
-# Why it works:
-#   The AI sees the memory as if it were part of the original instructions.
-#   It doesn't know it's "resuming"; it just uses the facts provided.
-# ---------------------------------------------------------------------------
-
 def _memory_block(ctx: str) -> str:
-    """
-    Format a raw memory string into a prompt preamble.
-    Returns empty string if there is no memory (first run).
-    """
     if not ctx or not ctx.strip():
         return ""
     return (
@@ -230,22 +119,92 @@ def _memory_block(ctx: str) -> str:
 
 
 # =============================================================================
-# THE FINALIZER PROMPT  --  "Memory Archivist"
+# PLAN PARSER -- Extracts structured tasks from plan.md
 # =============================================================================
-# This is the prompt we send to Kimi at the end of EVERY run.
-# Its job: compress the entire session into a tiny, dense packet
-# so the NEXT run can load it and pick up exactly where we left off.
-#
-# We force the output into a <MEMORY_DUMP> block with strict sections.
-# This makes parsing reliable and keeps the format predictable.
-# ---------------------------------------------------------------------------
+_PLAN_TASK_RE = re.compile(
+    r'###\s*\[(COMPLEX|SIMPLE)\]\s*(.+?)\n(.*?)(?=\n###\s*\[|$)',
+    re.DOTALL
+)
+_FILE_RE = re.compile(r'\*\*File\*\*:\s*`?([^\s`\n]+)`?')
+_DESC_RE = re.compile(r'\*\*Description\*\*:\s*(.+?)(?:\n\*\*|$)', re.DOTALL)
 
+
+def parse_plan_tasks(plan_md: str) -> list[dict]:
+    """
+    Parse a plan.md string into a list of task dicts.
+
+    Each task dict has:
+        description: str   -- what to implement
+        complexity: str    -- "complexa" or "simple"
+        target_file: str   -- relative path to write to
+    """
+    tasks: list[dict] = []
+    for match in _PLAN_TASK_RE.finditer(plan_md):
+        complexity_raw = match.group(1).lower()
+        title = match.group(2).strip()
+        body = match.group(3).strip()
+
+        complexity = "complexa" if complexity_raw == "complex" else "simple"
+
+        file_match = _FILE_RE.search(body)
+        target_file = file_match.group(1) if file_match else f"task_{len(tasks):03d}.py"
+
+        desc_match = _DESC_RE.search(body)
+        description = desc_match.group(1).strip() if desc_match else title
+
+        tasks.append({
+            "description": description,
+            "complexity": complexity,
+            "target_file": target_file,
+        })
+    return tasks
+
+
+# =============================================================================
+# PLAN FILE PERSISTENCE
+# =============================================================================
+def save_plan(output_dir: str, plan_md: str) -> str:
+    """Write plan.md to the project directory. Returns the full path."""
+    plan_path = os.path.join(output_dir, "plan.md")
+    os.makedirs(output_dir, exist_ok=True)
+    with open(plan_path, "w", encoding="utf-8") as f:
+        f.write(plan_md)
+    return plan_path
+
+
+def update_plan_task_status(plan_md: str, task_index: int, status: str) -> str:
+    """
+    Mark the nth task in the plan as done/in-progress while preserving
+    the [COMPLEX]/[SIMPLE] tag so parse_plan_tasks() still works.
+    """
+    count = 0
+    def _replace(m):
+        nonlocal count
+        if count == task_index:
+            count += 1
+            complexity_raw = m.group(1)
+            title = m.group(2).strip()
+            icon = "✅" if status == "done" else "🔄"
+            return f"### [{complexity_raw}] {icon} {title}"
+        count += 1
+        return m.group(0)
+
+    return re.sub(
+        r'###\s*\[(COMPLEX|SIMPLE)\]\s*(.+)',
+        _replace,
+        plan_md
+    )
+
+
+# =============================================================================
+# THE FINALIZER PROMPT
+# =============================================================================
 FINALIZER_PROMPT = """\
 You are the Session Memory Archivist. Your sole job is to compress the entire working context of this session into a dense, self-contained memory packet.
 
-TWO types of AI agents will read this dump in the future:
-  - CLAUDE:    handles complex logic, algorithms, integrations, debugging.
-  - OPENCODE:  handles boilerplate, data structures, repetitive scaffolding.
+TWO types of coder agents will read this dump in the future:
+  - COMPLEX:  handles complex logic, algorithms, integrations, debugging.
+  - SIMPLE:   handles boilerplate, data structures, repetitive scaffolding.
 
 Output STRICTLY inside a single <MEMORY_DUMP> ... </MEMORY_DUMP> block. Use this EXACT internal structure:
 
@@ -257,17 +216,17 @@ Output STRICTLY inside a single <MEMORY_DUMP> ... </MEMORY_DUMP> block. Use this
 [TASK_STACK]
 - Done: <list>
 - In-Progress: <list>
-- Pending[CLAUDE]: <tasks that need complex reasoning>
-- Pending[OPENCODE]: <tasks that are boilerplate/repetitive>
+- Pending[COMPLEX]: <tasks that need complex reasoning>
+- Pending[SIMPLE]: <tasks that are boilerplate/repetitive>
 
 [KEY_DECISIONS]
-- <decision> | Rationale: <why> | Owner: CLAUDE|OPENCODE
+- <decision> | Rationale: <why> | Target: COMPLEX|SIMPLE
 
 [SCRATCHPAD]
 - Debug notes, hypotheses, dead ends, known failure modes
 
 [NEXT_ACTION]
-- Target: CLAUDE|OPENCODE
+- Target: COMPLEX|SIMPLE
 - Task: <single highest-priority next step with full context>
 - Files: <exact paths to touch>
 - Signature: <exact function/class name to create or modify>
@@ -277,163 +236,291 @@ RULES:
 2. NEVER reference "above", "earlier", or "the file I mentioned". 100% self-contained.
 3. Include FULL file paths and exact function/class names.
 4. No markdown outside <MEMORY_DUMP>. No greetings. No summaries.
-5. Tag every pending task with [CLAUDE] or [OPENCODE] so the router can skip reading.
-6. If an existing memory block is provided, MERGE and UPDATE — do not replace blindly.
+5. Tag every pending task with [COMPLEX] or [SIMPLE] so the router can skip reading.
+6. If an existing memory block is provided, MERGE and UPDATE -- do not replace blindly.
 """
 
 
 # =============================================================================
-# GRAPH NODES  --  Each one is a step in the LangGraph pipeline
+# PLANNER PROMPT -- Generates the full project plan
 # =============================================================================
-# A "node" is just a Python function that receives the current AgentState,
-# does some work (usually calling an AI via subprocess), and returns a
-# dictionary of the fields it wants to update.
+
+PLANNER_PROMPT = """\
+You are a Senior Software Architect. Your job is to create a complete implementation plan for the following project specification.
+
+Break the project into atomic, ordered tasks. Each task MUST be tagged as [COMPLEX] or [SIMPLE]:
+
+- [COMPLEX] = algorithms, business logic, integrations, state machines, physics, AI, concurrency.
+- [SIMPLE] = data classes, config, enums, boilerplate, scaffolding, simple properties, plain CRUD.
+
+OUTPUT FORMAT (STRICT):
+```
+# Project Plan: <short-name>
+
+## Architecture
+<2-4 sentences about architecture, patterns, key decisions>
+
+## Project Structure
+- `<relative/path.py>` - Purpose of the file
+- `<relative/path2.py>` - Purpose of the file
+
+## Tasks
+
+### [SIMPLE] Brief task title
+- **File**: `<relative/path.py>`
+- **Description**: What to implement, classes/functions to create.
+
+### [COMPLEX] Brief task title
+- **File**: `<relative/path.py>`
+- **Description**: What to implement, algorithm details, edge cases.
+
+(continue for ALL tasks)
+```
+
+RULES:
+1. Order tasks by dependency: foundational first, dependent later.
+2. EVERY task MUST have a target File path.
+3. Include ALL files in the Project Structure section.
+4. SIMPLE tasks first (data models, config) then COMPLEX (logic, integration).
+5. Use exact class/function names in descriptions.
+6. Output ONLY the plan, no extra text.
+"""
+
+
+# =============================================================================
+# GRAPH NODE FACTORIES
+# =============================================================================
+# Every node follows DIP: receives AgentClient via factory injection.
 #
 # FLOW:
-#   architect_node -> route_task -> [claude_coder_node OR opencode_coder_node]
-#                                   -> finalize_node -> END
+#   optimizer → planner → executor → [complex|simple] → executor (loop)
+#                        executor → finalize → END
 # ---------------------------------------------------------------------------
 
-def opencode_optimizer_node(state: AgentState):
+def make_optimizer_node(client: AgentClient):
+    """NODE 0: Refines raw user input into a structured spec."""
+
+    def optimizer_node(state: AgentState):
+        _emit("optimizer", "Optimitzant prompt de l'usuari...")
+        message = (
+            "You are a prompt engineering specialist. "
+            "Rewrite the following raw user requirement into a precise, structured "
+            "software specification for an architect AI. "
+            "Use bullet points for clarity. Separate functional requirements from "
+            "technical constraints. Output ONLY the refined specification:\n\n"
+            f"{state['project_requirements']}"
+        )
+        refined = client.run(message, state.get("session_id", ""))
+        _emit("optimizer", "Prompt optimitzat.")
+        return {"project_requirements": refined}
+
+    return optimizer_node
+
+
+def make_planner_node(client: AgentClient):
     """
-    NODE 0: El Traductor de Prompts (OpenCode)
-    -------------------------------------------
-    Rep el requeriment brut de l'usuari i el converteix en una especificació
-    neta i estructurada que l'Arquitecte (Kimi) pot consumir directament.
+    NODE 1: The Planner (replaces Architect).
+    ==========================================
+    Takes the structured spec and generates a full project plan
+    with [COMPLEX] / [SIMPLE] tasks, output directory, and file structure.
 
-    Flux de dades:
-      state['project_requirements'] (text brut de l'usuari)
-        -> OpenCode reformula
-        -> state['project_requirements'] (especificació estructurada)
-
-    Per que OpenCode i no Kimi?
-      OpenCode és el més econòmic del sistema. No té sentit gastar tokens de
-      Kimi en tasques de formatació quan OpenCode pot fer-ho igualment bé.
+    Writes plan.md to the project directory.
     """
-    _emit("opencode", "Optimitzant prompt de l'usuari...")
-    message = (
-        "You are a prompt engineering specialist. "
-        "Rewrite the following raw user requirement into a precise, structured "
-        "software specification for an architect AI. "
-        "Use bullet points for clarity. Separate functional requirements from "
-        "technical constraints. Output ONLY the refined specification:\n\n"
-        f"{state['project_requirements']}"
-    )
-    refined = _run_opencode(message, state.get("session_id", ""))
-    _emit("opencode", "Prompt optimitzat.")
-    return {"project_requirements": refined}
+
+    def planner_node(state: AgentState):
+        _emit("architect", "Elaborant pla de projecte (Planner)...")
+        session_id = state.get("session_id", "default")
+        output_dir = _ensure_project_dir(session_id)
+
+        memory = _memory_block(state.get("memory_context", ""))
+        prompt = (
+            f"{PLANNER_PROMPT}\n\n"
+            f"### PROJECT SPECIFICATION ###\n"
+            f"{state['project_requirements']}{memory}\n\n"
+            "Generate the complete plan now."
+        )
+
+        plan_md = client.run(prompt, session_id)
+
+        # Save plan.md to project directory
+        plan_path = save_plan(output_dir, plan_md)
+
+        # Parse tasks
+        tasks = parse_plan_tasks(plan_md)
+        total = len(tasks)
+
+        _emit("architect",
+              f"Pla creat: {total} tasques ({sum(1 for t in tasks if t['complexity']=='complexa')} complexes, "
+              f"{sum(1 for t in tasks if t['complexity']=='simple')} simples)")
+        _emit("system", f"Directori: {output_dir}")
+        _emit("system", f"Pla guardat a: {plan_path}")
+
+        return {
+            "plan_md": plan_md,
+            "task_index": 0,
+            "total_tasks": total,
+            "output_dir": output_dir,
+            "current_task": "",
+            "complexity": "",
+        }
+
+    return planner_node
 
 
-def architect_node(state: AgentState):
+def make_executor_node():
     """
-    NODE 1: The Architect (Kimi)
-    -------------------------------
-    Reads the project requirements + any resumed memory.
-    Decides WHAT to do next and HOW HARD it is.
+    NODE 2: The Executor (Task Dispatcher).
+    ========================================
+    Ran BEFORE each coder and AFTER each coder (loop).
 
-    Output format expected from Kimi:
-        Line 1: "simple" or "complexa"
-        Line 2+: the refined atomic task description
-
-    Returns:
-        {"complexity": "simple|complexa", "current_task": "..."}
+    On entry:
+      - If generated_code is present → write it to target_file, advance index.
+      - If pending tasks remain → dispatch next task (set current_task, complexity).
+      - If all tasks done → return without complexity (router goes to finalize).
     """
-    _emit("kimi", "Analitzant requeriments (Arquitecte)...")
-    memory = _memory_block(state.get("memory_context", ""))
-    prompt = (
-        f"You are a software Architect. Analyse this requirement: {state['project_requirements']}\n"
-        f"Current task context: {state['current_task']}{memory}\n"
-        "1. Refine the atomic task to implement.\n"
-        "2. Classify the complexity strictly as 'complexa' or 'simple'.\n"
-        "Reply with ONLY the complexity word on the first line, "
-        "and the refined task description on the second line. No extra text."
-    )
-    response = _run_kimi(prompt, state.get("session_id", "")).split('\n')
-    complexity = response[0].strip().lower()
-    task_description = "\n".join(response[1:]).strip()
-    _emit("kimi", f"Complexitat: {complexity} | {task_description[:60]}")
-    return {"complexity": complexity, "current_task": task_description}
+
+    def executor_node(state: AgentState):
+        task_index = state.get("task_index", 0)
+        total_tasks = state.get("total_tasks", 0)
+        generated = state.get("generated_code", "")
+        target = state.get("target_file", "")
+        output_dir = state.get("output_dir", "")
+        plan_md = state.get("plan_md", "")
+
+        # --- Write file if we just came from a coder ---
+        if generated and target and output_dir:
+            file_path = os.path.join(output_dir, target)
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(generated)
+            _emit("system", f"Escrit: {target} ({len(generated)} chars)")
+
+            # Mark task as done in plan.md (keeps [COMPLEX]/[SIMPLE] tag)
+            updated = update_plan_task_status(plan_md, task_index, "done")
+            save_plan(output_dir, updated)
+            plan_md = updated
+            task_index += 1
+
+        # --- Dispatch next task (or finish) ---
+        if task_index < total_tasks:
+            tasks = parse_plan_tasks(plan_md)
+            if task_index < len(tasks):
+                next_task = tasks[task_index]
+                _emit("system",
+                      f"Tasca {task_index + 1}/{total_tasks} "
+                      f"[{'COMPLEX' if next_task['complexity'] == 'complexa' else 'SIMPLE'}]: "
+                      f"{next_task['description'][:60]}")
+                return {
+                    "current_task": next_task["description"],
+                    "complexity": next_task["complexity"],
+                    "target_file": next_task["target_file"],
+                    "task_index": task_index,
+                    "plan_md": plan_md,
+                    "generated_code": "",
+                }
+
+        _emit("system", f"Totes les {total_tasks} tasques completades.")
+        return {
+            "task_index": task_index,
+            "plan_md": plan_md,
+            "generated_code": "",
+        }
+
+    return executor_node
 
 
-def claude_coder_node(state: AgentState):
+def make_complex_coder_node(client: AgentClient):
     """
-    NODE 2A: The Advanced Coder (Claude)
-    -------------------------------------
-    Handles 'complexa' tasks: algorithms, business logic, hard integrations.
-    Receives the refined task + memory context.
-    Returns the raw code as a string.
+    NODE 3A: The Complex Coder.
+    ============================
+    Handles [COMPLEX] tasks: algorithms, business logic, integrations.
+    Receives exact task description, target file, and project context.
     """
-    _emit("claude", f"Codificant tasca complexa: {state['current_task'][:60]}...")
-    memory = _memory_block(state.get("memory_context", ""))
-    prompt = (
-        f"You are an expert software engineer. Solve this complex task and output ONLY the code:\n"
-        f"{state['current_task']}{memory}"
-    )
-    return {"generated_code": _run_claude(prompt, state.get("session_id", ""))}
+
+    def complex_coder_node(state: AgentState):
+        task = state.get("current_task", "")
+        target = state.get("target_file", "")
+        output_dir = state.get("output_dir", "")
+        memory = _memory_block(state.get("memory_context", ""))
+
+        _emit("complex", f"Codificant [COMPLEX]: {task[:60]}...")
+        prompt = (
+            f"You are an expert software engineer. Implement this COMPLEX task.\n\n"
+            f"TASK: {task}\n"
+            f"TARGET FILE: {target}\n"
+            f"PROJECT DIRECTORY: {output_dir}\n"
+            f"{memory}\n"
+            f"Output ONLY the complete, production-ready code for this file. "
+            f"Include ALL imports, type hints, docstrings, and error handling. "
+            f"No explanations, no markdown fences — just the raw code."
+        )
+        code = client.run(prompt, state.get("session_id", ""))
+        _emit("complex", f"Completat: {target}")
+        return {"generated_code": code}
+
+    return complex_coder_node
 
 
-def opencode_coder_node(state: AgentState):
+def make_simple_coder_node(client: AgentClient):
     """
-    NODE 2B: The Basic Coder (OpenCode)
-    ------------------------------------
-    Handles 'simple' tasks: boilerplate, data structures, repetitive code.
-    Receives the refined task + memory context.
-    Returns the raw code as a string.
+    NODE 3B: The Simple Coder.
+    ===========================
+    Handles [SIMPLE] tasks: data classes, config, boilerplate, scaffolding.
     """
-    _emit("opencode", f"Codificant tasca simple: {state['current_task'][:60]}...")
-    memory = _memory_block(state.get("memory_context", ""))
-    message = (
-        f"Write the code for this task, output ONLY the code:\n"
-        f"{state['current_task']}{memory}"
-    )
-    return {"generated_code": _run_opencode(message, state.get("session_id", ""))}
+
+    def simple_coder_node(state: AgentState):
+        task = state.get("current_task", "")
+        target = state.get("target_file", "")
+        output_dir = state.get("output_dir", "")
+        memory = _memory_block(state.get("memory_context", ""))
+
+        _emit("simple", f"Codificant [SIMPLE]: {task[:60]}...")
+        message = (
+            f"Implement this SIMPLE task.\n\n"
+            f"TASK: {task}\n"
+            f"TARGET FILE: {target}\n"
+            f"PROJECT DIRECTORY: {output_dir}\n"
+            f"{memory}\n"
+            f"Output ONLY the complete code for this file. "
+            f"Include ALL imports and type hints. "
+            f"No explanations, no markdown fences — just the raw code."
+        )
+        code = client.run(message, state.get("session_id", ""))
+        _emit("simple", f"Completat: {target}")
+        return {"generated_code": code}
+
+    return simple_coder_node
 
 
-def finalize_node(state: AgentState):
+def make_finalize_node(client: AgentClient):
     """
-    NODE 3: The Memory Archivist (Kimi)
-    ------------------------------------
-    Runs AFTER coding, every single time.
-
-    WHAT IT DOES:
-      1. Collects everything that happened this run:
-         project name, task, complexity, generated code snippet.
-      2. Loads the PREVIOUS memory dump (up to 6000 chars to stay within
-         reasonable context windows).
-      3. Sends all of that to Kimi with the FINALIZER_PROMPT.
-      4. Kimi returns a new <MEMORY_DUMP> block.
-      5. We parse the block, save it to disk, and return it into the state
-         so the graph has it for the remainder of this execution.
-
-    WHY THIS MATTERS:
-      Without this step, every new python src/main.py would be a blank slate.
-      With it, the Architect sees the full project history on the next run.
+    NODE 4: The Memory Archivist.
+    ==============================
+    Runs AFTER all tasks complete. Compresses session into memory dump.
     """
-    _emit("kimi", "Arxivant memòria de sessió (Memory Archivist)...")
-    # Truncate existing memory so we don't blow past the context window.
-    # 6000 chars is a safe heuristic for most local CLI models.
-    existing_memory = state.get("memory_context", "")[:6000]
 
-    # Build the mega-prompt for the Archivist
-    prompt = (
-        f"{FINALIZER_PROMPT}\n\n"
-        f"Session ID: {state.get('session_id', 'default')}\n"
-        f"Project: {state['project_requirements']}\n"
-        f"Task: {state['current_task']}\n"
-        f"Complexity: {state['complexity']}\n"
-        f"Generated code snippet:\n{state['generated_code'][:2000]}\n\n"
-        f"Existing memory to merge/update:\n{existing_memory}\n\n"
-        "Produce the updated <MEMORY_DUMP>."
-    )
+    def finalize_node(state: AgentState):
+        _emit("finalizer", "Arxivant memoria de sessio...")
+        existing_memory = state.get("memory_context", "")[:6000]
+        plan_md = state.get("plan_md", "")[:2000]
 
-    response = _run_kimi(prompt, state.get("session_id", ""))
+        prompt = (
+            f"{FINALIZER_PROMPT}\n\n"
+            f"Session ID: {state.get('session_id', 'default')}\n"
+            f"Project: {state['project_requirements'][:500]}\n"
+            f"Output directory: {state.get('output_dir', '')}\n"
+            f"Plan summary:\n{plan_md}\n\n"
+            f"Existing memory to merge/update:\n{existing_memory}\n\n"
+            "Produce the updated <MEMORY_DUMP>."
+        )
 
-    # Extract the <MEMORY_DUMP>...</MEMORY_DUMP> block using regex.
-    # re.DOTALL makes '.' match newlines, so we can grab multi-line dumps.
-    match = re.search(r'<MEMORY_DUMP>(.*?)</MEMORY_DUMP>', response, re.DOTALL)
-    dump = match.group(1).strip() if match else response
+        response = client.run(prompt, state.get("session_id", ""))
 
-    # Persist to disk so the NEXT python run can load it.
-    save_memory(state.get("session_id", "default"), dump)
-    _emit("kimi", "Memòria guardada al disc.")
-    return {"memory_context": dump}
+        match = re.search(r'<MEMORY_DUMP>(.*?)</MEMORY_DUMP>', response, re.DOTALL)
+        dump = match.group(1).strip() if match else response
+
+        save_memory(state.get("session_id", "default"), dump)
+        _emit("finalizer", "Memoria guardada al disc.")
+        return {"memory_context": dump}
+
+    return finalize_node

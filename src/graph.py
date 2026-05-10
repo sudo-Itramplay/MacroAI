@@ -1,135 +1,121 @@
 """
 src/graph.py
 ============
-This module builds the LangGraph StateGraph that orchestrates the agents.
+Builds the LangGraph StateGraph that orchestrates multi-agent execution.
 
-WHAT IS A STATEGRAPH?
-  Think of it as a flowchart where each box is a Python function (a "node")
-  and the arrows are rules that decide which box to run next.
-  The graph passes a shared dictionary (AgentState) from node to node.
-
-OUR FLOW:
+FLOW (with task loop):
   ┌───────────┐
-  │ optimizer │  <-- entry point (OpenCode structures the raw user input)
+  │ optimizer │  <-- entry: fast model structures raw user input
   └─────┬─────┘
         │
         ▼
-  ┌─────────────┐
-  │  architect  │  <-- Kimi plans the task using the structured spec
-  └──────┬──────┘
-         │
-         ▼
-    ┌────────┐
-    │ route  │  <-- conditional: "complexa" or "simple" ?
-    └───┬────┘
+  ┌──────────┐
+  │ planner  │  <-- powerful model creates full plan.md with [COMPLEX]/[SIMPLE]
+  └─────┬────┘
         │
-   ┌────┴────┐
-   ▼         ▼
-┌──────┐  ┌────────┐
-│claude│  │opencode│  <-- one coder runs, depending on complexity
-└──┬───┘  └───┬────┘
-   │          │
-   └────┬─────┘
         ▼
-   ┌─────────┐
-   │finalize │  <-- ALWAYS runs last (saves memory for next time)
-   └────┬────┘
-        ▼
-       END
+  ┌──────────┐
+  │ executor │◄──────────────────────────┐
+  └─────┬────┘                           │
+        │                                │
+        ▼                                │
+   ┌─────────┐                           │
+   │  route  │──► complex ───────────────┤
+   │  next   │──► simple  ───────────────┘
+   │         │──► finalize → END
+   └─────────┘
+
+DEPENDENCY INJECTION:
+  build_graph() receives an AgentFactory, creates nodes with clients injected.
 """
 
 from typing import Literal
 from langgraph.graph import StateGraph, END
 from src.agents import (
     AgentState,
-    opencode_optimizer_node,
-    architect_node,
-    claude_coder_node,
-    opencode_coder_node,
-    finalize_node,
+    make_optimizer_node,
+    make_planner_node,
+    make_executor_node,
+    make_complex_coder_node,
+    make_simple_coder_node,
+    make_finalize_node,
 )
+from src.clients import AgentFactory
 
 
-def route_task(state: AgentState) -> Literal["claude", "opencode"]:
+def route_next(state: AgentState) -> Literal["complex", "simple", "finalize"]:
     """
-    ROUTER FUNCTION  --  The "traffic cop" of the graph.
-    ================================================
-    This function runs AFTER architect_node. It looks at the
-    'complexity' field that the Architect wrote and decides which
-    coder should handle the task.
+    ROUTER FUNCTION -- Decides where the executor should go next.
 
-    Returns:
-        "claude"    -> if complexity contains the word "complexa"
-        "opencode"  -> for everything else (assumes "simple")
-
-    The returned string MUST match one of the keys in the
-    add_conditional_edges() dictionary inside build_graph().
+    Runs AFTER executor_node. Checks:
+      - If all tasks are done (task_index >= total_tasks) → finalize
+      - If next task is complex → complex coder
+      - Otherwise → simple coder
     """
+    task_index = state.get("task_index", 0)
+    total_tasks = state.get("total_tasks", 0)
+
+    if task_index >= total_tasks:
+        return "finalize"
+
     if "complexa" in state.get("complexity", ""):
-        return "claude"
-    return "opencode"
+        return "complex"
+    return "simple"
 
 
-def build_graph():
+def build_graph(factory: AgentFactory | None = None):
     """
-    FACTORY FUNCTION  --  Builds and compiles the StateGraph.
-    ==========================================================
-    Call this once at startup (see main.py). It returns a compiled
-    graph object that you can invoke with an initial AgentState.
+    Builds and compiles the StateGraph with task-loop support.
+
+    Args:
+        factory: AgentFactory providing configured AgentClient per role.
     """
-    # Create a new graph that uses AgentState as its shared data schema.
+    if factory is None:
+        factory = AgentFactory()
+
+    # Create node functions with clients injected (DIP)
+    optimizer = make_optimizer_node(factory.create_optimizer())
+    planner = make_planner_node(factory.create_architect())
+    executor = make_executor_node()
+    complex_coder = make_complex_coder_node(factory.create_complex_coder())
+    simple_coder = make_simple_coder_node(factory.create_simple_coder())
+    finalize = make_finalize_node(factory.create_finalizer())
+
     workflow = StateGraph(AgentState)
 
-    # -------------------------------------------------------------------------
-    # REGISTER NODES
-    # -------------------------------------------------------------------------
-    # Every node is just a Python function. The string name is how we
-    # reference it when wiring up edges.
-    # -------------------------------------------------------------------------
-    workflow.add_node("optimizer", opencode_optimizer_node)
-    workflow.add_node("architect", architect_node)
-    workflow.add_node("claude", claude_coder_node)
-    workflow.add_node("opencode", opencode_coder_node)
-    workflow.add_node("finalize", finalize_node)
+    # Register nodes
+    workflow.add_node("optimizer", optimizer)
+    workflow.add_node("planner", planner)
+    workflow.add_node("executor", executor)
+    workflow.add_node("complex", complex_coder)
+    workflow.add_node("simple", simple_coder)
+    workflow.add_node("finalize", finalize)
 
-    # -------------------------------------------------------------------------
-    # SET ENTRY POINT
-    # -------------------------------------------------------------------------
-    # The optimizer runs first: it translates the raw user text into a clean
-    # structured spec before the Architect ever sees it.
-    # -------------------------------------------------------------------------
+    # Entry point
     workflow.set_entry_point("optimizer")
 
-    # optimizer always feeds directly into architect
-    workflow.add_edge("optimizer", "architect")
+    # optimizer → planner
+    workflow.add_edge("optimizer", "planner")
 
-    # -------------------------------------------------------------------------
-    # CONDITIONAL EDGE: architect -> (claude OR opencode)
-    # -------------------------------------------------------------------------
-    # After the architect node finishes, LangGraph calls route_task() and
-    # looks at the returned string. The dictionary below maps that string
-    # to the name of the next node to run.
-    # -------------------------------------------------------------------------
+    # planner → executor (dispatches first task)
+    workflow.add_edge("planner", "executor")
+
+    # executor → complex | simple | finalize (conditional loop)
     workflow.add_conditional_edges(
-        "architect",          # source node
-        route_task,           # routing function
+        "executor",
+        route_next,
         {
-            "claude": "claude",      # if route_task returns "claude", go here
-            "opencode": "opencode"   # if route_task returns "opencode", go here
+            "complex": "complex",
+            "simple": "simple",
+            "finalize": "finalize",
         }
     )
 
-    # -------------------------------------------------------------------------
-    # SEQUENTIAL EDGES: coders -> finalize -> END
-    # -------------------------------------------------------------------------
-    # Both coders MUST pass through finalize before the graph ends.
-    # This guarantees that EVERY run produces a memory snapshot,
-    # even if the coder crashes or returns garbage.
-    # -------------------------------------------------------------------------
-    workflow.add_edge("claude", "finalize")
-    workflow.add_edge("opencode", "finalize")
+    # Coders loop back to executor (for next task)
+    workflow.add_edge("complex", "executor")
+    workflow.add_edge("simple", "executor")
+
+    # finalize → END
     workflow.add_edge("finalize", END)
 
-    # Compile the graph into an executable object.
-    # This validates the topology (no dead ends, no orphan nodes, etc.)
     return workflow.compile()

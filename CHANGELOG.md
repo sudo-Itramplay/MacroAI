@@ -1,6 +1,52 @@
 # Changelog
 
-## [Unreleased] — Subprocess CLI Architecture + Session Memory
+## [Unreleased] — SOLID Refactoring: Unified OpenCode Backend
+
+### Overview
+Removed `claude` and `kimi` CLI dependencies. All agents now use a single CLI tool (OpenCode) with different `--model` flags per role. The architecture was rebuilt following **SOLID principles** so model selection is fully configurable via environment variables and the graph nodes are decoupled from any concrete CLI implementation.
+
+### Architecture (SOLID Map)
+
+| Principle | Where |
+|-----------|-------|
+| **S** (SRP) | `OpenCodeClient` has one reason to change: the opencode CLI interface. |
+| **O** (OCP) | `AgentFactory` is open for extension (new roles/models) but closed for modification. |
+| **L** (LSP) | Any `AgentClient` implementation can substitute another transparently. |
+| **I** (ISP) | `AgentClient` exposes only `run(prompt, session_id)` — nothing more. |
+| **D** (DIP) | Graph nodes receive `AgentClient` via factory injection, never import concrete wrappers. |
+
+### New Module: `src/clients.py`
+
+- **`AgentClient`** (ABC) — interface that all agent clients implement.
+- **`OpenCodeClient`** — wraps `opencode run --model provider/model`.
+- **`ModelConfig`** — immutable config, overridable via environment variables.
+- **`AgentFactory`** — creates configured clients per role (optimizer, architect, complex, simple, finalizer).
+
+### Changes
+
+- **Removed:** `_run_kimi()`, `_run_claude()`, `_run_opencode()` from `src/agents.py`.
+- **Removed:** `claude` and `kimi` binary checks from `init.sh` (only `opencode` required).
+- **Refactored:** All graph nodes are now factory functions (`make_*_node`) that receive `AgentClient` via dependency injection.
+- **Renamed nodes:** `claude` → `complex`, `opencode` → `simple`. The router now returns `"complex"` / `"simple"`.
+- **Updated:** `.env.example` with `MACROAI_*_MODEL` variables.
+- **Updated:** UI widgets use role-based agent names (`optimizer`, `architect`, `complex`, `simple`, `finalizer`).
+- **Updated:** `FINALIZER_PROMPT` references COMPLEX/SIMPLE instead of CLAUDE/OPENCODE.
+
+### Model Defaults
+
+| Role | Model |
+|------|-------|
+| Optimizer | `opencode-go/deepseek-v4-flash` |
+| Architect | `opencode-go/deepseek-v4-pro` |
+| Complex Coder | `opencode-go/deepseek-v4-pro` |
+| Simple Coder | `opencode-go/deepseek-v4-flash` |
+| Finalizer | `opencode-go/deepseek-v4-pro` |
+
+Override via `MACROAI_OPTIMIZER_MODEL`, `MACROAI_ARCHITECT_MODEL`, etc.
+
+---
+
+## [Previous] — Subprocess CLI Architecture + Session Memory
 
 ### Overview
 The entire LLM integration layer was rebuilt from API-key-based LangChain bindings to thin **subprocess wrappers** that invoke the local CLI tools you already have installed (Kimi, Claude, OpenCode). This removes all API-key management, quota anxiety, and vendor SDK dependencies. A **session memory persistence layer** was added so multi-step projects survive across process restarts.

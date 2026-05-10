@@ -1,16 +1,18 @@
 """
 ui/widgets/log_panel.py
 ========================
-Panel central inferior: log en temps real dels agents CLI.
+Panel central inferior: log en temps real dels agents.
 
-CODIFICACIÓ DE COLORS PER AGENT
----------------------------------
-  violet  -> Kimi   (Arquitecte i Archivist de memòria)
-  orange  -> Claude (Codificador complex)
-  cyan    -> OpenCode (Optimitzador i codificador simple)
-  white   -> Sistema (missatges de control del runner)
+CODIFICACIO DE COLORS PER ROL
+-------------------------------
+  magenta -> architect (Arquitecte)
+  yellow  -> complex   (Codificador de tasques complexes)
+  cyan    -> simple    (Codificador de tasques simples)
+  blue    -> optimizer (Optimitzador de prompts)
+  green   -> finalizer (Archivist de memoria)
+  white   -> system    (Missatges de control del runner)
 
-Usem RichLog de Textual que suporta markup Rich i té scroll automàtic.
+Usem RichLog de Textual que suporta markup Rich i te scroll automatic.
 """
 
 from datetime import datetime
@@ -22,10 +24,12 @@ from ui.runner import LogEntry
 
 # Mapeig d'agent -> (color Rich, badge curt)
 _AGENT_STYLE: dict[str, tuple[str, str]] = {
-    "kimi":     ("violet",    "KIMI "),
-    "claude":   ("orange1",   "CLAUD"),
-    "opencode": ("cyan",      "OC   "),
-    "system":   ("dim white", "SYS  "),
+    "optimizer": ("blue",        "OPT  "),
+    "architect": ("magenta",     "ARCH "),
+    "complex":   ("yellow",      "CPLX "),
+    "simple":    ("cyan",        "SMPL "),
+    "finalizer": ("green",       "FINAL"),
+    "system":    ("dim white",   "SYS  "),
 }
 
 
@@ -34,7 +38,7 @@ class LogPanel(Widget):
     Widget de log en temps real.
 
     La UI crida add_entry() des del _poll_queues() de l'App per afegir
-    cada LogEntry que el GraphRunner emet durant l'execució del graf.
+    cada LogEntry que el GraphRunner emet durant l'execucio del graf.
     """
 
     DEFAULT_CSS = """
@@ -71,5 +75,5 @@ class LogPanel(Widget):
         self.add_entry(LogEntry(agent="system", message=message, is_error=is_error))
 
     def clear_log(self) -> None:
-        """Buida el log (útil en iniciar una nova execució)."""
+        """Buida el log (util en iniciar una nova execucio)."""
         self.query_one(RichLog).clear()
