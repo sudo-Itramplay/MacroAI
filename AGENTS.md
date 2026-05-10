@@ -71,6 +71,9 @@ It adds a `✅` marker but keeps the tag so `parse_plan_tasks()` still finds the
 **`subprocess.TimeoutExpired` is not caught in `OpenCodeClient.run()`.**
 The 180s timeout raises `subprocess.TimeoutExpired` which propagates as a generic exception. `GraphRunner` catches it broadly. If you need specific error messages, catch it in `run()`.
 
+**`--session` is NOT passed to opencode CLI.**
+The opencode `--session` flag requires an existing session ID (`ses_abc123`), not a custom string. Passing `"macroai-session"` causes "Session not found". Cross-call continuity is handled by MacroAI's memory system (`_memory_block()`), not opencode's native sessions.
+
 ## SOLID Map
 
 | Principle | Where |

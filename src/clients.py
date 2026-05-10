@@ -93,12 +93,15 @@ class OpenCodeClient(AgentClient):
         """
         Spawn `opencode run --model <model>` and return clean stdout.
 
-        Session continuity is achieved via `--session` when session_id is
-        provided, letting opencode maintain its own internal context.
+        NOTE: We intentionally do NOT pass --session to opencode.
+        The --session flag requires an existing opencode session ID
+        (e.g. 'ses_abc123'), not a custom string. Passing a custom ID
+        like "macroai-session" causes "Session not found" errors.
+
+        Cross-call continuity is handled by MacroAI's own memory system:
+        _memory_block() injects previous context into every prompt.
         """
         cmd = ["opencode", "run", "--model", self._model]
-        if session_id:
-            cmd.extend(["--session", session_id])
         cmd.append(prompt)
 
         result = subprocess.run(
