@@ -35,6 +35,7 @@ from src.agents import (
     AgentState,
     make_optimizer_node,
     make_planner_node,
+    make_scaffolder_node,
     make_executor_node,
     make_complex_coder_node,
     make_simple_coder_node,
@@ -76,6 +77,7 @@ def build_graph(factory: AgentFactory | None = None):
     # Create node functions with clients injected (DIP)
     optimizer = make_optimizer_node(factory.create_optimizer())
     planner = make_planner_node(factory.create_architect())
+    scaffolder = make_scaffolder_node()
     executor = make_executor_node()
     complex_coder = make_complex_coder_node(factory.create_complex_coder())
     simple_coder = make_simple_coder_node(factory.create_simple_coder())
@@ -86,6 +88,7 @@ def build_graph(factory: AgentFactory | None = None):
     # Register nodes
     workflow.add_node("optimizer", optimizer)
     workflow.add_node("planner", planner)
+    workflow.add_node("scaffolder", scaffolder)
     workflow.add_node("executor", executor)
     workflow.add_node("complex", complex_coder)
     workflow.add_node("simple", simple_coder)
@@ -94,11 +97,10 @@ def build_graph(factory: AgentFactory | None = None):
     # Entry point
     workflow.set_entry_point("optimizer")
 
-    # optimizer → planner
+    # optimizer → planner → scaffolder → executor (dispatches first task)
     workflow.add_edge("optimizer", "planner")
-
-    # planner → executor (dispatches first task)
-    workflow.add_edge("planner", "executor")
+    workflow.add_edge("planner", "scaffolder")
+    workflow.add_edge("scaffolder", "executor")
 
     # executor → complex | simple | finalize (conditional loop)
     workflow.add_conditional_edges(

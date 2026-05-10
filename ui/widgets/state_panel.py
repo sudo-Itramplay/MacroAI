@@ -15,14 +15,15 @@ from textual.widgets import Label, Static
 
 from ui.runner import StateSnapshot
 
-_NODE_ORDER = ["optimizer", "planner", "complex", "simple", "executor", "finalize"]
+_NODE_ORDER = ["optimizer", "planner", "scaffolder", "complex", "simple", "executor", "finalize"]
 _NODE_LABELS = {
-    "optimizer": "optimizer",
-    "planner":   "planner",
-    "complex":   "coder+",
-    "simple":    "coder-",
-    "executor":  "dispatch",
-    "finalize":  "finalize",
+    "optimizer":  "optimizer",
+    "planner":    "planner",
+    "scaffolder": "scaffold",
+    "complex":    "coder+",
+    "simple":     "coder-",
+    "executor":   "dispatch",
+    "finalize":   "finalize",
 }
 
 

@@ -1,2 +1,0 @@
-I see the existing files only contain placeholder summaries, not real code. I need to create real implementations for all dependencies and the DashboardPage. Let me write everything with actual code.
-Done. `src/pages/DashboardPage.tsx` composes `DashboardStats` (stats row at top), `WeeklyVolumeChart` and `DisciplinePieChart` (responsive 2-column grid below), and `WorkoutList` with `maxItems={5}` (recent sessions at bottom). All data flows from `useWorkouts()` via the `workouts` array.

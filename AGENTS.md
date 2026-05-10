@@ -23,13 +23,14 @@ CI runs these three in order on push/PR to `main`. If any fails, the build fails
 All agents use a single CLI tool (`opencode`) with different `--model` flags. No kimi, no claude binaries.
 
 ```
-optimizer → planner → executor → {complex|simple} → executor (loop)
-                                   executor → finalize → END
+optimizer → planner → scaffolder → executor → {complex|simple} → executor (loop)
+                                                executor → finalize → END
 ```
 
 - **optimizer** — fast model refines raw user input into structured spec
 - **planner** — powerful model generates `plan.md` with `[COMPLEX]`/`[SIMPLE]` tasks
-- **executor** — dispatches next pending task, writes coder output to files, loops until all tasks done
+- **scaffolder** — deterministic (no AI), pre-creates directory tree and empty target files declared in the plan; skips existing files
+- **executor** — dispatches next pending task, writes coder output to files (Safe mode only), loops until all tasks done
 - **complex** — powerful model handles algorithms, business logic, integrations
 - **simple** — fast model handles boilerplate, data classes, scaffolding
 - **finalize** — compresses session into `<MEMORY_DUMP>` for next run
@@ -41,7 +42,7 @@ The executor writes files, not the coders. Coders return code strings; executor 
 | File | Purpose |
 |------|---------|
 | `src/clients.py` | `AgentClient` ABC, `OpenCodeClient`, `ModelConfig`, `AgentFactory` — SOLID DI layer |
-| `src/agents.py` | `AgentState`, plan parser, node factories (`make_*_node`), memory persistence |
+| `src/agents.py` | `AgentState`, plan parser, node factories (`make_*_node`, including `make_scaffolder_node`), memory persistence |
 | `src/graph.py` | `build_graph(factory)` wires nodes + edges, `route_next()` router |
 | `src/main.py` | CLI entry point |
 | `main_ui.py` | Textual UI entry point |

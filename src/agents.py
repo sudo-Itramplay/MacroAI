@@ -368,6 +368,54 @@ def make_planner_node(client: AgentClient):
     return planner_node
 
 
+def make_scaffolder_node():
+    """
+    NODE 1.5: Scaffolder.
+    =====================
+    Runs AFTER the planner and BEFORE the executor.
+
+    Pre-creates the directory structure and empty target files declared in
+    the plan. Deterministic, no AI call. Skips existing files (never
+    overwrites). Solves two real problems:
+      1. opencode's write tool sometimes fails when the parent dir doesn't
+         exist or when the file is read before being written.
+      2. Coders that consult sibling files (via -f or own tools) get
+         predictable, bounded existence guarantees.
+
+    Designed to be extended later (e.g., seed __init__.py, license headers,
+    boilerplate stubs) without changing the graph topology.
+    """
+
+    def scaffolder_node(state: AgentState):
+        output_dir = state.get("output_dir", "")
+        plan_md = state.get("plan_md", "")
+        if not output_dir or not plan_md:
+            _emit("system", "Scaffolder: sense plan o output_dir, saltant.", is_error=True)
+            return {}
+
+        tasks = parse_plan_tasks(plan_md)
+        created = 0
+        skipped = 0
+        for task in tasks:
+            target = task.get("target_file", "")
+            if not target:
+                continue
+            file_path = os.path.join(output_dir, target)
+            os.makedirs(os.path.dirname(file_path) or output_dir, exist_ok=True)
+            if os.path.exists(file_path):
+                skipped += 1
+                continue
+            with open(file_path, "a", encoding="utf-8"):
+                pass
+            created += 1
+
+        _emit("system",
+              f"Scaffolding: {created} fitxers creats, {skipped} ja existents.")
+        return {}
+
+    return scaffolder_node
+
+
 def make_executor_node():
     """
     NODE 2: Task Dispatcher.
