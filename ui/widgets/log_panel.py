@@ -19,6 +19,7 @@ from datetime import datetime
 from textual.app import ComposeResult
 from textual.widget import Widget
 from textual.widgets import Label, RichLog
+from textual.binding import Binding
 
 from ui.runner import LogEntry
 
@@ -41,6 +42,10 @@ class LogPanel(Widget):
     cada LogEntry que el GraphRunner emet durant l'execucio del graf.
     """
 
+    BINDINGS = [
+        Binding("c", "copy_log", "Copiar log", show=True),
+    ]
+
     DEFAULT_CSS = """
     LogPanel {
         layout: vertical;
@@ -50,6 +55,10 @@ class LogPanel(Widget):
         height: 1fr;
     }
     """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._entries: list[str] = []
 
     def compose(self) -> ComposeResult:
         yield Label("LOG EN VIU", classes="panel-title")
@@ -68,6 +77,7 @@ class LogPanel(Widget):
         else:
             line = f"[dim]{ts}[/dim] [bold {color}][{badge}][/bold {color}] {entry.message}"
 
+        self._entries.append(f"[{ts}] [{badge}] {entry.message}")
         self.query_one(RichLog).write(line)
 
     def add_system(self, message: str, is_error: bool = False) -> None:
@@ -76,4 +86,11 @@ class LogPanel(Widget):
 
     def clear_log(self) -> None:
         """Buida el log (util en iniciar una nova execucio)."""
+        self._entries.clear()
         self.query_one(RichLog).clear()
+
+    def action_copy_log(self) -> None:
+        """Copia tot el contingut del log al clipboard."""
+        text = "\n".join(self._entries) if self._entries else "(log buit)"
+        self.app.copy_to_clipboard(text)
+        self.notify("Log copiat al clipboard", timeout=2)

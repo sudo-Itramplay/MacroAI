@@ -7,6 +7,17 @@ Mostra:
   - Barra de pipeline: [optimizer] -> [planner] -> [executor/coders] -> [finalize]
   - Progres de tasques: Tasca 3/7 [COMPLEX] ...
   - Fitxer actual: src/engine.py
+  - Mode: SAFE (executor escriu) o AUTO (opencode escriu directament)
+
+UPDATES:
+  Rep StateSnapshot objects des del _poll_queues() de l'App.
+  Cada snapshot conte el nom del node que acaba d'executar i el seu
+  partial_state (les claus que el node va retornar al LangGraph).
+
+NONE-GUARDS:
+  El LangGraph pot injectar None en certes transicions internes.
+  Tots els accessos a partial_state usen "or ''" o "is not None" per
+  evitar TypeError: argument of type 'NoneType' is not iterable.
 """
 
 from textual.app import ComposeResult
@@ -15,6 +26,7 @@ from textual.widgets import Label, Static
 
 from ui.runner import StateSnapshot
 
+# Order matters for visual left-to-right pipeline display
 _NODE_ORDER = ["optimizer", "planner", "scaffolder", "complex", "simple", "executor", "finalize"]
 _NODE_LABELS = {
     "optimizer":  "optimizer",
@@ -28,6 +40,7 @@ _NODE_LABELS = {
 
 
 class StatePanel(Widget):
+    """Visualitza l'estat del pipeline LangGraph i el progres de tasques."""
     DEFAULT_CSS = """
     StatePanel {
         layout: vertical;
@@ -91,7 +104,7 @@ class StatePanel(Widget):
             self._completed_nodes.append(snap.node_name)
         self._render_pipeline()
 
-        partial = snap.partial_state
+        partial = snap.partial_state if snap.partial_state is not None else {}
 
         if "task_index" in partial:
             self._task_index = partial["task_index"]
@@ -108,7 +121,7 @@ class StatePanel(Widget):
             pct = done * 100 // self._total_tasks
             bar_filled = "█" * (pct // 10)
             bar_empty = "░" * (10 - pct // 10)
-            c = self._complexity
+            c = self._complexity or ""
             tag = "COMPLEX" if "complexa" in c else ("SIMPLE" if c else "?")
             color = "yellow" if "complexa" in c else ("cyan" if c else "dim")
             self.query_one("#progress-field", Static).update(

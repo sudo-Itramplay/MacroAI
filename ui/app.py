@@ -34,6 +34,18 @@ GESTIO DE LA CONCURRENCIA
     - asyncio.create_task(runner.run(...))  -> executa el graf
     - asyncio.create_task(_poll_queues())   -> polling de les cues de log/estat
   Ambdues tasques corren concurrent en el bucle asyncio de Textual.
+
+  El GraphRunner executa el graf en un ThreadPoolExecutor (blocking LangGraph)
+  i injecta LogEntry/StateSnapshot a les cues asyncio via call_soon_threadsafe.
+  El _poll_queues() les buida cada 80ms i actualitza els widgets.
+
+COMUNICACIO AMB WIDGETS FILLS
+-------------------------------
+  - ProjectPanel emet SessionSelected/SessionCreated via Textual messages.
+    L'App escolta amb @on() decorators.
+  - LogPanel rep LogEntry cridant add_entry() des del polling loop.
+  - StatePanel rep StateSnapshot cridant update_from_snapshot().
+  - ResultPanel rep el codi generat al final de l'execucio.
 """
 
 import asyncio
@@ -48,7 +60,11 @@ from ui.widgets import ProjectPanel, LogPanel, StatePanel, ResultPanel
 
 
 class MacroAIApp(App):
-    """Aplicacio TUI principal de MacroAI."""
+    """Aplicacio TUI principal de MacroAI.
+
+    Orquestra la UI, gestiona el cicle de vida del GraphRunner,
+    i manté la coherència entre els panells fills.
+    """
 
     TITLE = "MacroAI"
     SUB_TITLE = "Sistema Multiagent (OpenCode + LangGraph)"
@@ -269,7 +285,7 @@ class MacroAIApp(App):
                 result.get("total_tasks", 0),
             )
             # Actualitzem la llista de sessions per reflectir la nova memoria guardada
-            self.query_one(ProjectPanel)._refresh_list()
+            self.query_one(ProjectPanel).refresh_sessions()
 
         except Exception as exc:
             log.add_system(f"Error durant l'execucio: {exc}", is_error=True)

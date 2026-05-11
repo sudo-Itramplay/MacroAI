@@ -1,6 +1,31 @@
 # Changelog
 
-## [Unreleased] — SOLID Refactoring: Unified OpenCode Backend
+## [Unreleased] — SOLID Refactoring + Comments + README Overhaul
+
+### SOLID Refactors
+
+- **Extracted `MemoryStore` class** (`src/agents.py`): All file I/O for session memory and plan persistence now lives in a single cohesive class. Node factories receive `MemoryStore` via dependency injection instead of calling module-level functions.
+- **`_coder_prompt` accepts `auto_approve` parameter**: Removed hidden dependency on global `is_auto_approve()`. Function is now pure and testable.
+- **`GraphRunner` accepts injected `AgentFactory`**: Constructor injection enables testing with mock factories. Defaults to `AgentFactory()` when not provided.
+- **`ProjectPanel.refresh_sessions()` public method**: Replaced cross-class private method call (`_refresh_list()`) with a proper public API.
+- **`StateSnapshot` and `LogEntry` remain in `runner.py`**: Evaluated moving to `agents.py` but they are UI-layer concerns, not domain objects.
+
+### Bug Fixes (from previous session)
+
+- **`route_next()` None guard** (`src/graph.py:62`): `state.get("complexity") or ""` prevents TypeError when LangGraph merges None values.
+- **`_run_graph_sync()` None guard** (`ui/runner.py`): Skips None partial_state from LangGraph internal transitions.
+- **`state_panel.py` None guards**: All `in` checks on `partial_state` and `complexity` are protected against None.
+
+### UX
+
+- **LogPanel copy support**: Press `c` to copy all log content to clipboard (plain text).
+
+### Documentation
+
+- **README.md**: Complete rewrite reflecting unified OpenCode architecture, multi-task loop, scaffolder node, Safe/Auto modes, SOLID map, and updated keyboard shortcuts.
+- **Comments**: Enhanced docstrings across all 11 source files with module purpose, class responsibility, method contracts, thread-safety notes, and rationale for non-obvious patterns.
+
+## [Previous] — SOLID Refactoring: Unified OpenCode Backend
 
 ### Overview
 Removed `claude` and `kimi` CLI dependencies. All agents now use a single CLI tool (OpenCode) with different `--model` flags per role. The architecture was rebuilt following **SOLID principles** so model selection is fully configurable via environment variables and the graph nodes are decoupled from any concrete CLI implementation.

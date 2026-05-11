@@ -1,21 +1,25 @@
 """
 ui/widgets/project_panel.py
 ============================
-Panel esquerre de la UI: llista de sessions i creació de noves.
+Panel esquerre de la UI: llista de sessions i creacio de noves.
 
 DESCOBERTA DE SESSIONS
 -----------------------
-Escanegem el directori .macroai_memory/ al directori de treball actual.
-Cada fitxer .md correspon a una sessió (session_id = nom del fitxer sense .md).
-Ordenem alfabèticament per fer la llista predictible.
+Escaneja el directori .macroai_memory/ al directori de treball actual.
+Cada fitxer .md correspon a una sessio (session_id = nom del fitxer sense .md).
+Ordena alfabeticament per fer la llista predictible.
 
-COMUNICACIÓ AMB EL PARE (l'App)
+COMUNICACIO AMB EL PARE (l'App)
 ---------------------------------
 Usem el sistema de missatges de Textual en comptes de callbacks.
-  ProjectPanel.SessionSelected  -> l'usuari ha clicat una sessió existent
-  ProjectPanel.SessionCreated   -> l'usuari ha creat una nova sessió
+  ProjectPanel.SessionSelected  -> l'usuari ha clicat una sessio existent
+  ProjectPanel.SessionCreated   -> l'usuari ha creat una nova sessio
 
 L'App escolta aquests missatges amb @on(ProjectPanel.SessionSelected).
+
+PUBLIC API:
+  refresh_sessions() -> refresca la llista de sessions des del disc.
+                        Cridat per l'App despres d'executar el graf.
 """
 
 import os
@@ -26,9 +30,9 @@ from textual.widgets import Label, ListView, ListItem, Input, Button
 
 
 class _SessionItem(ListItem):
-    """
-    ListItem personalitzat que emmagatzema el session_id directament.
-    Evitem extreure el text del Label (fràgil) guardant el valor al widget.
+    """ListItem personalitzat que emmagatzema el session_id directament.
+
+    Evitem extreure el text del Label (fragil) guardant el valor al widget.
     """
     def __init__(self, session_id: str) -> None:
         super().__init__(Label(f"  {session_id}"))
@@ -87,6 +91,15 @@ class ProjectPanel(Widget):
         yield Button("+ Crear sessió", id="create-session-btn", variant="success")
 
     def on_mount(self) -> None:
+        self.refresh_sessions()
+
+    def refresh_sessions(self) -> None:
+        """Public API: refresh the session list from disk.
+
+        Called by the App after graph execution completes to pick up newly
+        created memory files. Also called internally on mount and after
+        session creation.
+        """
         self._refresh_list()
 
     def _refresh_list(self) -> None:
@@ -128,4 +141,4 @@ class ProjectPanel(Widget):
         inp.value = ""
         self.post_message(self.SessionCreated(session_id))
         # Refresquem per si el nou fitxer ja existia o s'acaba de crear
-        self.set_timer(0.5, self._refresh_list)
+        self.set_timer(0.5, self.refresh_sessions)

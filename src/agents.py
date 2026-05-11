@@ -5,10 +5,11 @@ Core of the multi-agent system with multi-task planning support.
 
 WHAT IT DOES:
   1. Defines AgentState with task queue, plan, and output directory fields.
-  2. Manages session memory and project output directories.
+  2. Manages session memory and project output directories via MemoryStore.
   3. Implements the nodes:
      - optimizer_node   -> refines the user's raw prompt.
      - planner_node     -> creates a full project plan with [COMPLEX]/[SIMPLE] tasks.
+     - scaffolder_node  -> pre-creates directories and empty target files.
      - executor_node    -> dispatches the next pending task to the right coder.
      - complex_coder    -> handles complex tasks.
      - simple_coder     -> handles simple tasks.
@@ -21,6 +22,16 @@ ARCHITECTURE NOTES:
     them in the prompt — keeps the prompt small and bounded across tasks.
   - Permission mode (Safe/Auto) controls whether opencode writes files itself
     (Auto: native write tool) or returns code as text (Safe: executor writes).
+
+SOLID MAP:
+  S (SRP)  -> MemoryStore owns all persistence. Node factories own prompts.
+              parse_plan_tasks() is a pure stateless parser.
+  O (OCP)  -> New node types can be added by creating a new make_*_node factory
+              without modifying existing nodes or the MemoryStore.
+  L (LSP)  -> Any AgentClient implementation works in any node factory.
+  I (ISP)  -> Node factories only receive the dependencies they actually use.
+  D (DIP)  -> Node factories depend on AgentClient and MemoryStore abstractions,
+              never on global state or concrete file paths.
 """
 
 import os
@@ -30,8 +41,9 @@ from typing import Callable, Optional, TypedDict
 from src.clients import AgentClient, is_auto_approve
 
 # =============================================================================
-# DIRECTORIES
+# CONSTANTS
 # =============================================================================
+
 MEMORY_DIR = ".macroai_memory"
 PROJECTS_DIR = os.getenv("MACROAI_PROJECTS_DIR", os.path.join(os.getcwd(), "macroai_projects"))
 
@@ -40,113 +52,190 @@ PROJECTS_DIR = os.getenv("MACROAI_PROJECTS_DIR", os.path.join(os.getcwd(), "macr
 _CODER_MEMORY_CAP = 4000
 
 
+# =============================================================================
+# LOG SINK  (injected by GraphRunner, consumed by node factories via _emit)
+# =============================================================================
+
+LogSink = Callable[[str, str, bool], None]
+_log_sink: Optional[LogSink] = None
+
+
+def configure_log_sink(sink: Optional[LogSink]) -> None:
+    """Register or clear the log sink. Called by GraphRunner on run start/end."""
+    global _log_sink
+    _log_sink = sink
+
+
+def _emit(agent: str, message: str, is_error: bool = False) -> None:
+    """Emit a log entry through the registered sink (if any)."""
+    if _log_sink is not None:
+        _log_sink(agent, message, is_error)
+
+
+# =============================================================================
+# AgentState  (shared state dictionary passed through the LangGraph)
+# =============================================================================
+
+class AgentState(TypedDict, total=False):
+    """TypedDict with total=False: all fields are optional.
+
+    LangGraph merges partial state updates from each node. A node only needs
+    to return the keys it wants to update; missing keys preserve their current
+    value. Always use state.get("key", default) — never state["key"].
+    """
+    project_requirements: str   # Raw or optimized user spec
+    current_task: str           # Description of the task being coded
+    complexity: str             # "complexa" or "simple" (Catalan, from plan parser)
+    generated_code: str         # Code output from the active coder (Safe mode)
+    session_id: str             # Session identifier for memory persistence
+    memory_context: str         # Compressed memory dump from prior runs
+    plan_md: str                # Full markdown plan with [COMPLEX]/[SIMPLE] tasks
+    task_index: int             # Current position in the task list
+    total_tasks: int            # Total number of tasks in the plan
+    target_file: str            # Relative path of the file being generated
+    output_dir: str             # Absolute path to the project output directory
+
+
+# =============================================================================
+# HELPERS  (pure functions, no I/O)
+# =============================================================================
+
 def _project_dir(session_id: str) -> str:
+    """Return the absolute output directory path for a session."""
     return os.path.join(PROJECTS_DIR, session_id)
 
 
 def _ensure_project_dir(session_id: str) -> str:
+    """Create the project directory if needed and return its path."""
     path = _project_dir(session_id)
     os.makedirs(path, exist_ok=True)
     return path
 
 
 # =============================================================================
-# LOG SINK
+# MemoryStore  (SRP: all persistence lives here)
 # =============================================================================
-LogSink = Callable[[str, str, bool], None]
-_log_sink: Optional[LogSink] = None
 
+class MemoryStore:
+    """Encapsulates all file I/O for session memory and plan persistence.
 
-def configure_log_sink(sink: Optional[LogSink]) -> None:
-    global _log_sink
-    _log_sink = sink
+    Responsibilities:
+      - Load/save compressed memory dumps (.macroai_memory/<session>.md)
+      - Save/update plan.md files in project directories
+      - Write per-call memory.md snapshots for coder -f attachments
+      - Build the attachment list for coder calls
 
-
-def _emit(agent: str, message: str, is_error: bool = False) -> None:
-    if _log_sink is not None:
-        _log_sink(agent, message, is_error)
-
-
-# =============================================================================
-# AgentState
-# =============================================================================
-class AgentState(TypedDict, total=False):
-    project_requirements: str
-    current_task: str
-    complexity: str
-    generated_code: str
-    session_id: str
-    memory_context: str
-    plan_md: str
-    task_index: int
-    total_tasks: int
-    target_file: str
-    output_dir: str
-
-
-# =============================================================================
-# MEMORY PERSISTENCE
-# =============================================================================
-def _memory_file(session_id: str) -> str:
-    os.makedirs(MEMORY_DIR, exist_ok=True)
-    return os.path.join(MEMORY_DIR, f"{session_id}.md")
-
-
-def load_memory(session_id: str) -> str:
-    path = _memory_file(session_id)
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    return ""
-
-
-def save_memory(session_id: str, content: str) -> None:
-    path = _memory_file(session_id)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-
-
-def _write_session_memory_file(output_dir: str, memory_context: str) -> str | None:
+    Thread-safety: All methods are stateless (no mutable instance state beyond
+    constructor args). Safe to call from the ThreadPoolExecutor thread.
     """
-    Persist the session memory into the project dir as memory.md so it can
-    be passed via -f. Returns the absolute path or None if memory is empty.
-    """
-    if not memory_context or not memory_context.strip() or not output_dir:
-        return None
-    os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, "memory.md")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(memory_context.strip())
-    return path
 
+    def __init__(
+        self,
+        memory_dir: str = MEMORY_DIR,
+        projects_dir: str = PROJECTS_DIR,
+    ) -> None:
+        self._memory_dir = memory_dir
+        self._projects_dir = projects_dir
 
-def _coder_attachments(state: "AgentState") -> list[str]:
-    """
-    Build the list of -f attachments for a coder call: plan.md and memory.md
-    (if present). Both live under output_dir.
-    """
-    output_dir = state.get("output_dir", "")
-    attachments: list[str] = []
-    if not output_dir:
+    # -- Session memory persistence --
+
+    def _memory_file(self, session_id: str) -> str:
+        """Return the path to the session's memory dump file."""
+        os.makedirs(self._memory_dir, exist_ok=True)
+        return os.path.join(self._memory_dir, f"{session_id}.md")
+
+    def load_memory(self, session_id: str) -> str:
+        """Load the compressed memory dump for a session, or '' if none exists."""
+        path = self._memory_file(session_id)
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read()
+        return ""
+
+    def save_memory(self, session_id: str, content: str) -> None:
+        """Persist the compressed memory dump to disk."""
+        path = self._memory_file(session_id)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def write_session_memory_file(self, output_dir: str, memory_context: str) -> str | None:
+        """Write memory.md into the project dir for -f attachment.
+
+        Returns the absolute path, or None if memory_context is empty.
+        """
+        if not memory_context or not memory_context.strip() or not output_dir:
+            return None
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, "memory.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(memory_context.strip())
+        return path
+
+    # -- Plan file persistence --
+
+    def save_plan(self, output_dir: str, plan_md: str) -> str:
+        """Write plan.md to the project directory. Returns the absolute path."""
+        plan_path = os.path.join(output_dir, "plan.md")
+        os.makedirs(output_dir, exist_ok=True)
+        with open(plan_path, "w", encoding="utf-8") as f:
+            f.write(plan_md)
+        return plan_path
+
+    def update_plan_task_status(self, plan_md: str, task_index: int, status: str) -> str:
+        """Mark a task as done/in-progress in the plan markdown.
+
+        Preserves the [COMPLEX]/[SIMPLE] tag so parse_plan_tasks() still finds it.
+        Returns the updated markdown string.
+        """
+        count = 0
+        def _replace(m):
+            nonlocal count
+            if count == task_index:
+                count += 1
+                complexity_raw = m.group(1)
+                title = m.group(2).strip()
+                icon = "✅" if status == "done" else "🔄"
+                return f"### [{complexity_raw}] {icon} {title}"
+            count += 1
+            return m.group(0)
+
+        return re.sub(
+            r'###\s*\[(COMPLEX|SIMPLE)\]\s*(.+)',
+            _replace,
+            plan_md
+        )
+
+    # -- Coder attachment helpers --
+
+    def coder_attachments(self, state: "AgentState") -> list[str]:
+        """Build the -f attachment list for a coder call: plan.md + memory.md.
+
+        Both files live under output_dir. Memory.md is written fresh each call
+        so the coder always sees the latest compressed context.
+        """
+        output_dir = state.get("output_dir", "")
+        attachments: list[str] = []
+        if not output_dir:
+            return attachments
+
+        plan_path = os.path.join(output_dir, "plan.md")
+        if os.path.exists(plan_path):
+            attachments.append(plan_path)
+
+        memory_path = self.write_session_memory_file(
+            output_dir,
+            (state.get("memory_context", "") or "")[:_CODER_MEMORY_CAP],
+        )
+        if memory_path:
+            attachments.append(memory_path)
+
         return attachments
 
-    plan_path = os.path.join(output_dir, "plan.md")
-    if os.path.exists(plan_path):
-        attachments.append(plan_path)
-
-    memory_path = _write_session_memory_file(
-        output_dir,
-        (state.get("memory_context", "") or "")[:_CODER_MEMORY_CAP],
-    )
-    if memory_path:
-        attachments.append(memory_path)
-
-    return attachments
-
 
 # =============================================================================
-# PLAN PARSER
+# PLAN PARSER  (pure function, no I/O — stateless)
 # =============================================================================
+
 _PLAN_TASK_RE = re.compile(
     r'###\s*\[(COMPLEX|SIMPLE)\]\s*(.+?)\n(.*?)(?=\n###\s*\[|$)',
     re.DOTALL
@@ -156,6 +245,12 @@ _DESC_RE = re.compile(r'\*\*Description\*\*:\s*(.+?)(?:\n\*\*|$)', re.DOTALL)
 
 
 def parse_plan_tasks(plan_md: str) -> list[dict]:
+    """Parse the plan markdown into a list of task dicts.
+
+    Each dict has keys: description, complexity ("complexa"|"simple"), target_file.
+    The [COMPLEX]/[SIMPLE] tags are mapped to Catalan "complexa"/"simple" internally
+    because the router checks `"complexa" in complexity`.
+    """
     tasks: list[dict] = []
     for match in _PLAN_TASK_RE.finditer(plan_md):
         complexity_raw = match.group(1).lower()
@@ -179,39 +274,9 @@ def parse_plan_tasks(plan_md: str) -> list[dict]:
 
 
 # =============================================================================
-# PLAN FILE PERSISTENCE
+# PROMPT TEMPLATES
 # =============================================================================
-def save_plan(output_dir: str, plan_md: str) -> str:
-    plan_path = os.path.join(output_dir, "plan.md")
-    os.makedirs(output_dir, exist_ok=True)
-    with open(plan_path, "w", encoding="utf-8") as f:
-        f.write(plan_md)
-    return plan_path
 
-
-def update_plan_task_status(plan_md: str, task_index: int, status: str) -> str:
-    count = 0
-    def _replace(m):
-        nonlocal count
-        if count == task_index:
-            count += 1
-            complexity_raw = m.group(1)
-            title = m.group(2).strip()
-            icon = "✅" if status == "done" else "🔄"
-            return f"### [{complexity_raw}] {icon} {title}"
-        count += 1
-        return m.group(0)
-
-    return re.sub(
-        r'###\s*\[(COMPLEX|SIMPLE)\]\s*(.+)',
-        _replace,
-        plan_md
-    )
-
-
-# =============================================================================
-# FINALIZER PROMPT
-# =============================================================================
 FINALIZER_PROMPT = """\
 You are the Session Memory Archivist. Your sole job is to compress the entire working context of this session into a dense, self-contained memory packet.
 
@@ -254,9 +319,6 @@ RULES:
 """
 
 
-# =============================================================================
-# PLANNER PROMPT
-# =============================================================================
 PLANNER_PROMPT = """\
 You are a Senior Software Architect. Your job is to create a complete implementation plan for the following project specification.
 
@@ -300,11 +362,16 @@ RULES:
 
 
 # =============================================================================
-# GRAPH NODE FACTORIES
+# GRAPH NODE FACTORIES  (DIP: each receives its dependencies via parameters)
 # =============================================================================
 
 def make_optimizer_node(client: AgentClient):
-    """NODE 0: Refines raw user input into a structured spec."""
+    """NODE 0: Refines raw user input into a structured spec.
+
+    Uses a fast model (variant=minimal) to rewrite the user's free-text
+    requirement into a bullet-point specification suitable for the architect.
+    No memory or plan dependencies — only reads project_requirements.
+    """
 
     def optimizer_node(state: AgentState):
         _emit("optimizer", "Optimitzant prompt de l'usuari...")
@@ -323,8 +390,12 @@ def make_optimizer_node(client: AgentClient):
     return optimizer_node
 
 
-def make_planner_node(client: AgentClient):
-    """NODE 1: Creates the full project plan with [COMPLEX]/[SIMPLE] tasks."""
+def make_planner_node(client: AgentClient, store: MemoryStore):
+    """NODE 1: Creates the full project plan with [COMPLEX]/[SIMPLE] tasks.
+
+    Receives a MemoryStore to persist the plan and load prior session memory.
+    Writes plan.md to the output directory and parses task count for logging.
+    """
 
     def planner_node(state: AgentState):
         _emit("architect", "Elaborant pla de projecte (Planner)...")
@@ -333,7 +404,7 @@ def make_planner_node(client: AgentClient):
 
         # Persist memory to disk so the planner reads it via -f if available.
         memory_ctx = (state.get("memory_context", "") or "")[:_CODER_MEMORY_CAP * 2]
-        memory_path = _write_session_memory_file(output_dir, memory_ctx)
+        memory_path = store.write_session_memory_file(output_dir, memory_ctx)
 
         prompt = (
             f"{PLANNER_PROMPT}\n\n"
@@ -346,7 +417,7 @@ def make_planner_node(client: AgentClient):
         files = [memory_path] if memory_path else None
         plan_md = client.run(prompt, files=files)
 
-        plan_path = save_plan(output_dir, plan_md)
+        plan_path = store.save_plan(output_dir, plan_md)
         tasks = parse_plan_tasks(plan_md)
         total = len(tasks)
 
@@ -369,21 +440,16 @@ def make_planner_node(client: AgentClient):
 
 
 def make_scaffolder_node():
-    """
-    NODE 1.5: Scaffolder.
-    =====================
-    Runs AFTER the planner and BEFORE the executor.
+    """NODE 1.5: Scaffolder (deterministic, no AI call).
 
-    Pre-creates the directory structure and empty target files declared in
-    the plan. Deterministic, no AI call. Skips existing files (never
-    overwrites). Solves two real problems:
-      1. opencode's write tool sometimes fails when the parent dir doesn't
-         exist or when the file is read before being written.
-      2. Coders that consult sibling files (via -f or own tools) get
-         predictable, bounded existence guarantees.
+    Runs AFTER the planner and BEFORE the executor. Pre-creates the directory
+    structure and empty target files declared in the plan. Skips existing files
+    (never overwrites). Solves two problems:
+      1. opencode's write tool fails when parent dirs don't exist.
+      2. Coders consulting sibling files get predictable existence guarantees.
 
-    Designed to be extended later (e.g., seed __init__.py, license headers,
-    boilerplate stubs) without changing the graph topology.
+    Designed to be extended (e.g., seed __init__.py, license headers) without
+    changing the graph topology.
     """
 
     def scaffolder_node(state: AgentState):
@@ -416,9 +482,8 @@ def make_scaffolder_node():
     return scaffolder_node
 
 
-def make_executor_node():
-    """
-    NODE 2: Task Dispatcher.
+def make_executor_node(store: MemoryStore):
+    """NODE 2: Task Dispatcher (loops until all tasks are done).
 
     On entry:
       - If generated_code is present (Safe mode coder return) → write it.
@@ -426,6 +491,8 @@ def make_executor_node():
         empty and this branch is skipped.
       - Mark the previous task done in plan.md, advance index.
       - Dispatch next task or fall through to finalize.
+
+    Uses MemoryStore to persist plan status updates.
     """
 
     def executor_node(state: AgentState):
@@ -449,8 +516,8 @@ def make_executor_node():
         # (Auto mode: no generated_code, but the coder still ran — detected
         # by the presence of an active target_file.)
         if had_active_task:
-            updated = update_plan_task_status(plan_md, task_index, "done")
-            save_plan(output_dir, updated)
+            updated = store.update_plan_task_status(plan_md, task_index, "done")
+            store.save_plan(output_dir, updated)
             plan_md = updated
             task_index += 1
             if not generated:
@@ -486,10 +553,16 @@ def make_executor_node():
     return executor_node
 
 
-def _coder_prompt(task: str, target: str, output_dir: str, complexity_label: str) -> str:
-    """Build the per-call coder prompt. Auto mode tells opencode to write the
-    file with its native tool; Safe mode asks for raw code via stdout."""
-    if is_auto_approve():
+def _coder_prompt(task: str, target: str, output_dir: str, complexity_label: str, auto_approve: bool) -> str:
+    """Build the per-call coder prompt.
+
+    In Auto mode, tells opencode to use its native write tool and reply 'done'.
+    In Safe mode, asks for raw code via stdout (executor writes the file).
+
+    The auto_approve parameter is injected by the caller rather than reading
+    the global is_auto_approve() — this keeps the function pure and testable.
+    """
+    if auto_approve:
         return (
             f"Implement this {complexity_label} task by writing the code to "
             f"`{target}` using your write tool.\n\n"
@@ -514,8 +587,12 @@ def _coder_prompt(task: str, target: str, output_dir: str, complexity_label: str
     )
 
 
-def make_complex_coder_node(client: AgentClient):
-    """NODE 3A: Complex Coder. Algorithms, business logic, integrations."""
+def make_complex_coder_node(client: AgentClient, store: MemoryStore):
+    """NODE 3A: Complex Coder. Algorithms, business logic, integrations.
+
+    Uses a powerful model (full reasoning) for tasks tagged [COMPLEX].
+    Reads plan.md and memory.md via -f attachments built by MemoryStore.
+    """
 
     def complex_coder_node(state: AgentState):
         task = state.get("current_task", "")
@@ -523,8 +600,8 @@ def make_complex_coder_node(client: AgentClient):
         output_dir = state.get("output_dir", "")
 
         _emit("complex", f"Codificant [COMPLEX]: {task[:60]}...")
-        prompt = _coder_prompt(task, target, output_dir, "COMPLEX")
-        files = _coder_attachments(state)
+        prompt = _coder_prompt(task, target, output_dir, "COMPLEX", is_auto_approve())
+        files = store.coder_attachments(state)
 
         response = client.run(prompt, files=files, cwd=output_dir or None)
         _emit("complex", f"Completat: {target}")
@@ -536,8 +613,12 @@ def make_complex_coder_node(client: AgentClient):
     return complex_coder_node
 
 
-def make_simple_coder_node(client: AgentClient):
-    """NODE 3B: Simple Coder. Data classes, config, boilerplate."""
+def make_simple_coder_node(client: AgentClient, store: MemoryStore):
+    """NODE 3B: Simple Coder. Data classes, config, boilerplate.
+
+    Uses a fast model (variant=minimal) for tasks tagged [SIMPLE].
+    Same attachment strategy as complex_coder_node.
+    """
 
     def simple_coder_node(state: AgentState):
         task = state.get("current_task", "")
@@ -545,8 +626,8 @@ def make_simple_coder_node(client: AgentClient):
         output_dir = state.get("output_dir", "")
 
         _emit("simple", f"Codificant [SIMPLE]: {task[:60]}...")
-        prompt = _coder_prompt(task, target, output_dir, "SIMPLE")
-        files = _coder_attachments(state)
+        prompt = _coder_prompt(task, target, output_dir, "SIMPLE", is_auto_approve())
+        files = store.coder_attachments(state)
 
         response = client.run(prompt, files=files, cwd=output_dir or None)
         _emit("simple", f"Completat: {target}")
@@ -557,8 +638,13 @@ def make_simple_coder_node(client: AgentClient):
     return simple_coder_node
 
 
-def make_finalize_node(client: AgentClient):
-    """NODE 4: Memory Archivist. Compresses session into memory dump."""
+def make_finalize_node(client: AgentClient, store: MemoryStore):
+    """NODE 4: Memory Archivist. Compresses session into memory dump.
+
+    Runs after all tasks are done. Sends the full session context to a
+    powerful model and asks it to produce a <MEMORY_DUMP> block. The dump
+    is persisted via MemoryStore for the next run.
+    """
 
     def finalize_node(state: AgentState):
         _emit("finalizer", "Arxivant memoria de sessio...")
@@ -580,7 +666,7 @@ def make_finalize_node(client: AgentClient):
         match = re.search(r'<MEMORY_DUMP>(.*?)</MEMORY_DUMP>', response, re.DOTALL)
         dump = match.group(1).strip() if match else response
 
-        save_memory(state.get("session_id", "default"), dump)
+        store.save_memory(state.get("session_id", "default"), dump)
         _emit("finalizer", "Memoria guardada al disc.")
         return {"memory_context": dump}
 

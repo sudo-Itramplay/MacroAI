@@ -4,8 +4,10 @@ ui/widgets/result_panel.py
 Panel dret: visualitzador del codi generat o resum del projecte.
 
 Quan sha completat tot el graf mostra:
-  - Resum del projecte (directori, fitxers creats)
-  - Ultim codi generat
+  - Resum del projecte (directori, fitxers creats, tasques completades)
+  - Ultim codi generat amb ressaltat de sintaxi Python
+
+El TextArea es read_only i suporta seleccio de text nadiua (Ctrl+C).
 """
 
 import os
@@ -15,6 +17,7 @@ from textual.widgets import Label, Static, TextArea
 
 
 class ResultPanel(Widget):
+    """Mostra el resultat final del graf: fitxers creats i ultim codi generat."""
     DEFAULT_CSS = """
     ResultPanel {
         layout: vertical;

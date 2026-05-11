@@ -158,6 +158,10 @@ class OpenCodeClient(AgentClient):
             if path and os.path.exists(path):
                 cmd.extend(["-f", path])
 
+        # `--` separates flag args from the positional message. Without it,
+        # opencode's yargs parser greedily attaches the prompt to the
+        # preceding `-f` (an array flag), yielding "File not found: <prompt>".
+        cmd.append("--")
         cmd.append(prompt)
 
         try:
@@ -171,8 +175,10 @@ class OpenCodeClient(AgentClient):
             )
 
         if result.returncode != 0:
+            # opencode writes errors to stdout (not stderr); fall back when needed.
+            err = _strip_ansi(result.stderr).strip() or _strip_ansi(result.stdout).strip()
             raise RuntimeError(
-                f"OpenCode[{self._model}] error: {result.stderr.strip()}"
+                f"OpenCode[{self._model}] error (rc={result.returncode}): {err or '<no output>'}"
             )
         return _strip_ansi(result.stdout).strip()
 
@@ -249,16 +255,21 @@ class AgentFactory:
         return self._config
 
     def create_optimizer(self) -> AgentClient:
+        """Fast model with minimal reasoning — structures raw user input."""
         return OpenCodeClient(model=self._config.optimizer, variant="minimal")
 
     def create_architect(self) -> AgentClient:
+        """Full reasoning model — generates the project plan."""
         return OpenCodeClient(model=self._config.architect)
 
     def create_complex_coder(self) -> AgentClient:
+        """Full reasoning model — handles algorithms and business logic."""
         return OpenCodeClient(model=self._config.complex_coder)
 
     def create_simple_coder(self) -> AgentClient:
+        """Fast model with minimal reasoning — boilerplate and data classes."""
         return OpenCodeClient(model=self._config.simple_coder, variant="minimal")
 
     def create_finalizer(self) -> AgentClient:
+        """Full reasoning model — compresses session into memory dump."""
         return OpenCodeClient(model=self._config.finalizer)
