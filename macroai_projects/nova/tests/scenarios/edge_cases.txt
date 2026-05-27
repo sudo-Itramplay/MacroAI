@@ -1,0 +1,118 @@
+LOG === Edge Case Test Suite ===
+
+LOG --- Test 1: Rapid pin toggling (10ms intervals) ---
+SET_PIN 2 INPUT
+SET_ANALOG 0 0
+WAIT 100
+SET_PIN 2 HIGH
+WAIT 10
+SET_PIN 2 LOW
+WAIT 10
+SET_PIN 2 HIGH
+WAIT 10
+SET_PIN 2 LOW
+WAIT 10
+SET_PIN 2 HIGH
+WAIT 10
+SET_PIN 2 LOW
+WAIT 10
+SET_PIN 2 HIGH
+WAIT 10
+SET_PIN 2 LOW
+WAIT 100
+ASSERT_PIN 4 HIGH
+LOG Rapid toggling should not trigger alarm due to debounce
+
+LOG --- Test 2: Analog value injection at boundaries ---
+SET_ANALOG 0 0
+WAIT 50
+SET_ANALOG 0 1023
+WAIT 50
+SET_ANALOG 0 2047
+WAIT 50
+SET_ANALOG 6 512
+WAIT 50
+LOG Analog boundary injection complete
+
+LOG --- Test 3: Concurrent sensor events ---
+SET_PIN 2 LOW
+WAIT 200
+SET_PIN 2 HIGH
+WAIT 50
+SET_PIN 2 HIGH
+WAIT 50
+SET_PIN 2 HIGH
+WAIT 100
+ASSERT_PIN 3 HIGH
+ASSERT_PIN 5 HIGH
+WAIT 100
+LOG Concurrent events triggered alarm
+
+LOG --- Test 4: Motion detection trigger ---
+SET_PIN 2 LOW
+WAIT 100
+SET_PIN 2 HIGH
+WAIT 50
+SET_PIN 2 HIGH
+WAIT 50
+SET_PIN 2 HIGH
+WAIT 100
+ASSERT_PIN 3 HIGH
+ASSERT_PIN 5 HIGH
+LOG Motion detection verified
+
+LOG --- Test 5: Time step larger than alarm duration ---
+WAIT 6000
+ASSERT_PIN 3 LOW
+LOG Alarm should have ended after 6s wait
+
+LOG --- Test 6: Motion during cooldown period ---
+SET_PIN 2 LOW
+WAIT 100
+SET_PIN 2 HIGH
+WAIT 50
+SET_PIN 2 HIGH
+WAIT 50
+SET_PIN 2 HIGH
+WAIT 100
+ASSERT_PIN 3 HIGH
+WAIT 3000
+SET_PIN 2 HIGH
+WAIT 50
+SET_PIN 2 HIGH
+WAIT 50
+SET_PIN 2 HIGH
+WAIT 100
+ASSERT_PIN 3 HIGH
+LOG Motion during cooldown should reset timer
+
+LOG --- Test 7: Multiple overlapping motion bursts ---
+SET_PIN 2 LOW
+WAIT 200
+SET_PIN 2 HIGH
+WAIT 50
+SET_PIN 2 HIGH
+WAIT 50
+SET_PIN 2 HIGH
+WAIT 100
+ASSERT_PIN 3 HIGH
+SET_PIN 2 LOW
+WAIT 100
+SET_PIN 2 HIGH
+WAIT 50
+SET_PIN 2 HIGH
+WAIT 50
+SET_PIN 2 HIGH
+WAIT 100
+ASSERT_PIN 3 HIGH
+WAIT 3000
+SET_PIN 2 HIGH
+WAIT 50
+SET_PIN 2 HIGH
+WAIT 50
+SET_PIN 2 HIGH
+WAIT 100
+ASSERT_PIN 3 HIGH
+LOG Multiple overlapping bursts handled correctly
+
+LOG === All edge case tests completed ===

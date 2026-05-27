@@ -1,86 +1,92 @@
-I'll analyze the current project structure and generate the implementation plan.
-# Project Plan: Training Log SPA
+Here's the complete implementation plan:
+
+---
+
+# Project Plan: triathlon-tracker
 
 ## Architecture
-Single-page web application using vanilla JavaScript with modular ES6 classes, localStorage for persistence, and CSS Grid/Flexbox for responsive mobile-first layout. The app follows a Model-View-Controller pattern with a central `App` controller coordinating between `TrainingStore` (data layer), calendar/dashboard views, and UI components. All text in Catalan (ca-ES).
+Single-page app (vanilla JS + Vite) with client-side routing. All data persists in IndexedDB via a thin `StorageService` abstraction. FullCalendar renders the calendar view; Chart.js powers the dashboard. Auth is simulated (hashed passwords stored locally, session via sessionStorage). No backend — fully offline-capable.
 
 ## Project Structure
-- `index.html` - Main HTML shell with semantic structure
-- `css/styles.css` - Global styles, CSS variables, responsive grid
-- `css/calendar.css` - Calendar-specific styles and discipline colors
-- `css/dashboard.css` - Dashboard cards, charts, stats
-- `js/app.js` - App controller, routing, initialization
-- `js/store.js` - TrainingStore class, localStorage CRUD, export
-- `js/models.js` - TrainingSession data class, validation
-- `js/views/calendar.js` - CalendarView class, monthly/weekly rendering
-- `js/views/dashboard.js` - DashboardView class, stats, charts
-- `js/views/log.js` - LogView class, session form, list
-- `js/views/filter.js` - FilterView class, discipline toggles
-- `js/utils/dates.js` - Date helpers, ca-ES formatting
-- `js/utils/charts.js` - Canvas chart rendering (line/bar)
-- `js/i18n.js` - Catalan translations, locale config
+- `index.html` — Shell HTML with nav + view containers
+- `src/main.js` — App entry: router init, auth guard
+- `src/router.js` — Hash-based SPA router (`#/login`, `#/calendar`, `#/dashboard`, etc.)
+- `src/storage.js` — IndexedDB wrapper: `StorageService` class (CRUD for users, workouts)
+- `src/auth.js` — `AuthService`: register, login, logout, session check
+- `src/models/user.js` — `User` class (id, username, email, passwordHash, createdAt)
+- `src/models/workout.js` — `Workout` class (id, userId, date, sport, duration, distance, notes)
+- `src/views/login.js` — Login/register form rendering + handlers
+- `src/views/calendar.js` — FullCalendar integration, workout display on grid
+- `src/views/dashboard.js` — Chart.js charts, summary stats, streaks
+- `src/views/workout-form.js` — Create/edit workout modal or form
+- `src/views/workout-list.js` — Filterable/searchable workout table
+- `src/utils/validators.js` — Email regex, non-empty string, date validation
+- `src/utils/helpers.js` — Format duration, compute weekly volume, streak calc
+- `styles.css` — Responsive CSS (flexbox/grid), mobile-first
+- `package.json` — Dependencies: vite, fullcalendar, chart.js
 
 ## Tasks
 
-### [SIMPLE] Project scaffolding and HTML shell
-- **File**: `index.html`
-- **Description**: Create HTML5 boilerplate with viewport meta, ca-ES lang attribute, semantic sections (header, nav, main, footer), script modules, CSS links. Include `<div id="app">` container.
+### [SIMPLE] ✅ Project scaffolding and dependencies
+- **File**: `package.json`
+- **Description**: Create `package.json` with vite as dev dependency, fullcalendar (`@fullcalendar/core`, `@fullcalendar/daygrid`, `@fullcalendar/timegrid`, `@fullcalendar/interaction`), and `chart.js`. Add `dev`, `build` scripts.
 
-### [SIMPLE] CSS variables and global styles
-- **File**: `css/styles.css`
-- **Description**: Define CSS custom properties for colors (swim: blue, bike: green, run: orange), spacing, typography. Mobile-first base styles, utility classes, responsive breakpoints.
+### [SIMPLE] ✅ Shell HTML and base styles
+- **File**: `index.html`, `styles.css`
+- **Description**: `index.html` with `<nav>`, `<main id="app">`, script tag (type=module). `styles.css` with CSS reset, responsive layout (mobile-first flexbox/grid), nav styling, form styling, modal overlay, table styles.
 
-### [SIMPLE] Calendar styles and discipline colors
-- **File**: `css/calendar.css`
-- **Description**: Grid layout for month/week views, day cell styles, discipline color badges, today highlight, responsive calendar grid.
+### [SIMPLE] ✅ User model
+- **File**: `src/models/user.js`
+- **Description**: `User` class with fields: `id` (string UUID), `username` (string, non-empty), `email` (string, email regex validated), `passwordHash` (string), `createdAt` (ISO string). Include `static validate(user)` returning error array.
 
-### [SIMPLE] Dashboard styles
-- **File**: `css/dashboard.css`
-- **Description**: Stat cards grid, chart containers, streak display, responsive stacking for mobile.
+### [SIMPLE] ✅ Workout model
+- **File**: `src/models/workout.js`
+- **Description**: `Workout` class with fields: `id` (string UUID), `userId` (string), `date` (ISO string), `sport` (enum: `'swim'`, `'bike'`, `'run'`), `duration` (number, minutes), `distance` (number, km), `notes` (string, optional). Include `static validate(workout)` and `static SPORTS` enum constant.
 
-### [SIMPLE] Catalan translations and locale
-- **File**: `js/i18n.js`
-- **Description**: Export `I18n` object with `ca` translations (months, days, disciplines: Natació/Bicicleta/Córrer, UI labels). Date formatting functions using `Intl.DateTimeFormat('ca-ES')`.
+### [SIMPLE] ✅ Validators utility
+- **File**: `src/utils/validators.js`
+- **Description**: Export `isValidEmail(str)` using RFC-ish regex, `isNonEmpty(str)`, `isValidDate(str)` (ISO parse check), `isPositiveNumber(n)`. Pure functions, no side effects.
 
-### [SIMPLE] Date utility functions
-- **File**: `js/utils/dates.js`
-- **Description**: Functions: `getMonthDays(year, month)`, `getWeekDays(date)`, `formatDate(date, format)`, `isSameDay(d1, d2)`, `getWeekNumber(date)`. All use ca-ES locale.
+### [SIMPLE] ✅ Helper utilities
+- **File**: `src/utils/helpers.js`
+- **Description**: Export `generateId()` (crypto.randomUUID or fallback), `formatDuration(minutes)` → `"1h 23m"`, `formatDistance(km)` → `"12.5 km"`, `getWeekNumber(date)`, `startOfWeek(date)`, `endOfWeek(date)`.
 
-### [SIMPLE] TrainingSession data model
-- **File**: `js/models.js`
-- **Description**: `TrainingSession` class with properties: `id` (uuid), `date` (Date), `discipline` (enum: swim/bike/run), `duration` (minutes), `distance` (km), `intensity` (1-5), `heartRate` (optional bpm), `notes` (string). Validation methods for each field.
+### [COMPLEX] ✅ IndexedDB storage service
+- **File**: `src/storage.js`
+- **Description**: `StorageService` class wrapping IndexedDB with two object stores: `users` (keyPath: `id`, index on `email`) and `workouts` (keyPath: `id`, index on `userId`, `date`, `sport`). Methods: `init()` → opens DB (versioned migrations), `put(store, item)`, `get(store, id)`, `getAll(store)`, `delete(store, id)`, `queryByIndex(store, indexName, value)`, `queryByRange(store, indexName, lower, upper)`. Returns Promises. Handle DB version upgrades for schema changes.
 
-### [COMPLEX] TrainingStore with localStorage persistence
-- **File**: `js/store.js`
-- **Description**: `TrainingStore` class implementing CRUD operations. Methods: `getAll()`, `getById(id)`, `getByDateRange(start, end)`, `getByDiscipline(discipline)`, `save(session)`, `delete(id)`, `exportJSON()`, `exportCSV()`. localStorage key: `training_sessions`. Auto-generate UUIDs. Observable pattern for UI updates.
+### [COMPLEX] ✅ Auth service
+- **File**: `src/auth.js`
+- **Description**: `AuthService` class depending on `StorageService`. Methods: `register(username, email, password)` → validate, hash password (SHA-256 via SubtleCrypto), check email uniqueness, store user, return user. `login(email, password)` → lookup by email index, hash input, compare, store session in sessionStorage. `logout()` → clear sessionStorage. `getCurrentUser()` → read sessionStorage, fetch user from DB. `isLoggedIn()` → boolean.
 
-### [SIMPLE] Filter view component
-- **File**: `js/views/filter.js`
-- **Description**: `FilterView` class rendering discipline toggle buttons (swim/bike/run/all). Emits `filterChange` event with active disciplines array. Visual state for active/inactive toggles.
+### [COMPLEX] ✅ Hash-based SPA router
+- **File**: `src/router.js`
+- **Description**: `Router` class. Listens on `hashchange`. Route table maps `#/login`, `#/calendar`, `#/dashboard`, `#/workouts/new`, `#/workouts/:id/edit` → view render functions. Each view function receives the `#app` container and route params. Auth guard: redirect to `#/login` if not logged in (except login route). Export singleton `router`.
 
-### [COMPLEX] Calendar view with month/week modes
-- **File**: `js/views/calendar.js`
-- **Description**: `CalendarView` class rendering monthly grid (6x7) or weekly view. Methods: `renderMonth(year, month)`, `renderWeek(date)`, `addSession(session)`, `highlightDays(sessions)`. Click day to add/view sessions. Navigation arrows for prev/next. Responsive: week view on mobile, month on desktop.
+### [SIMPLE] ✅ Login/register view
+- **File**: `src/views/login.js`
+- **Description**: `renderLoginView(container)` function. Renders tabbed form (Login | Register). Login: email + password fields, submit → `AuthService.login()` → redirect `#/calendar`. Register: username + email + password + confirm, validate, submit → `AuthService.register()` → auto-login. Show inline validation errors. Responsive layout.
 
-### [COMPLEX] Dashboard view with stats and charts
-- **File**: `js/views/dashboard.js`
-- **Description**: `DashboardView` class displaying: total hours/distance per discipline per week/month (stat cards), line chart for volume trends (last 12 weeks), streak tracker (consecutive days with sessions). Canvas-based chart rendering.
+### [COMPLEX] ✅ Calendar view with FullCalendar
+- **File**: `src/views/calendar.js`
+- **Description**: `renderCalendarView(container)` function. Imports FullCalendar core + dayGridMonth + timeGridWeek + timeGridDay + interaction plugin. Loads workouts for current user from `StorageService`, maps to FullCalendar events (color-coded by sport: swim=blue, bike=green, run=red). Click event → show detail popover or navigate to edit. Date click → open new workout form with pre-filled date. Responsive: switch to list view on small screens. Handle month/week/day toggle.
 
-### [SIMPLE] Chart utility functions
-- **File**: `js/utils/charts.js`
-- **Description**: Functions: `drawLineChart(canvas, data, options)`, `drawBarChart(canvas, data, options)`. Support multiple datasets (one per discipline), axis labels, responsive canvas sizing.
+### [COMPLEX] ✅ Dashboard view with Chart.js
+- **File**: `src/views/dashboard.js`
+- **Description**: `renderDashboardView(container)` function. Computes: total hours per sport, total distance per sport, weekly volume (last 12 weeks stacked bar chart), current streak (consecutive days with workouts). Renders 4 summary stat cards + 2 Chart.js canvases (doughnut for sport distribution, stacked bar for weekly volume). Responsive grid layout. Recomputes on date range filter change.
 
-### [COMPLEX] Training log form and list view
-- **File**: `js/views/log.js`
-- **Description**: `LogView` class with form for creating/editing sessions (date picker, discipline select, duration/distance/intensity inputs, notes textarea). Validation feedback. List of recent sessions with edit/delete actions. Mobile-friendly form layout.
+### [COMPLEX] ✅ Workout form (create/edit)
+- **File**: `src/views/workout-form.js`
+- **Description**: `renderWorkoutForm(container, workoutId?)` function. If `workoutId` provided, load existing workout for edit; otherwise create new. Fields: date (date input), sport (select: swim/bike/run), duration (number input, minutes), distance (number input, km), notes (textarea). Validate on submit via `Workout.validate()`. On save → `StorageService.put()` → redirect to calendar. Cancel → back to calendar.
 
-### [COMPLEX] App controller and routing
-- **File**: `js/app.js`
-- **Description**: `App` class initializing store, views, and event listeners. Hash-based routing (#calendar, #dashboard, #log). Coordinates filter changes across views. Handles session CRUD flow (form submit → store → view update). Keyboard shortcuts for quick navigation.
+### [COMPLEX] ✅ Workout list with filter/search
+- **File**: `src/views/workout-list.js`
+- **Description**: `renderWorkoutList(container)` function. Renders filterable table: date range picker (start/end date inputs), sport dropdown filter (all/swim/bike/run). Query `StorageService` by index range (`userId` + `date` range + optional `sport`). Table columns: date, sport (badge), duration, distance, notes (truncated), actions (edit/delete). Sort by date descending. Pagination or virtual scroll for large datasets. Delete with confirmation.
 
-## Dependency Order
-1. `index.html`, CSS files, `i18n.js`, `dates.js` (foundational)
-2. `models.js`, `store.js` (data layer)
-3. `filter.js`, `charts.js` (utilities)
-4. `calendar.js`, `dashboard.js`, `log.js` (views)
-5. `app.js` (controller, depends on all above)
+### [SIMPLE] ✅ App entry point and router init
+- **File**: `src/main.js`
+- **Description**: Import `StorageService`, `AuthService`, `Router`, all views. On DOMContentLoaded: init StorageService (async `open()`), wire routes to view render functions, start router. Show loading state until DB ready.
+
+---
+
+This plan orders 8 SIMPLE tasks (models, config, UI scaffolding) before 5 COMPLEX tasks (storage, auth, routing, calendar, dashboard). Each task targets specific files with concrete class/function names.

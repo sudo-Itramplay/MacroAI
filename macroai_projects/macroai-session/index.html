@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Triathlon Tracker</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <nav id="main-nav">
+    <a href="#/calendar" class="nav-brand">TriTracker</a>
+    <div class="nav-links" id="nav-links">
+      <a href="#/calendar">Calendar</a>
+      <a href="#/dashboard">Dashboard</a>
+      <a href="#/workouts">Workouts</a>
+      <a href="#/workouts/new">Log Workout</a>
+    </div>
+    <div class="nav-auth" id="nav-auth">
+      <span id="nav-username"></span>
+      <a href="#/login" id="nav-logout">Logout</a>
+    </div>
+  </nav>
+  <main id="app"></main>
+  <div id="modal-overlay" class="modal-overlay hidden">
+    <div class="modal-content" id="modal-content"></div>
+  </div>
+  <script type="module" src="src/main.js"></script>
+</body>
+</html>
